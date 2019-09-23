@@ -1039,9 +1039,6 @@ void register_netfn_sen_functions()
     ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_WILDCARD, nullptr,
                            ipmi_sen_wildcard, PRIVILEGE_USER);
 
-    // <Platform Event Message>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_PLATFORM_EVENT, nullptr,
-                           ipmicmdPlatformEvent, PRIVILEGE_OPERATOR);
     // <Get Sensor Type>
     ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_GET_SENSOR_TYPE, nullptr,
                            ipmi_sen_get_sensor_type, PRIVILEGE_USER);
