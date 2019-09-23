@@ -498,7 +498,7 @@ ipmi::RspType<uint32_t> // current time
         log<level::ERR>(e.what());
         return ipmi::responseUnspecifiedError();
     }
-    catch (const std::runtime_error& e)
+    catch (const std::exception& e)
     {
         log<level::ERR>(e.what());
         return ipmi::responseUnspecifiedError();
@@ -550,7 +550,7 @@ ipmi::RspType<> ipmiStorageSetSelTime(uint32_t selDeviceTime)
         log<level::ERR>(e.what());
         return ipmi::responseUnspecifiedError();
     }
-    catch (const std::runtime_error& e)
+    catch (const std::exception& e)
     {
         log<level::ERR>(e.what());
         return ipmi::responseUnspecifiedError();
