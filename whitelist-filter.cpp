@@ -157,7 +157,7 @@ void WhitelistFilter::postInit()
 
 ipmi::Cc WhitelistFilter::filterMessage(ipmi::message::Request::ptr request)
 {
-    if (request->ctx->channel == ipmi:channelPrimaryIpmb && restrictedMode)
+    if (request->ctx->channel == ipmi::channelPrimaryIpmb && restrictedMode)
     {
         if (!std::binary_search(
                 whitelist.cbegin(), whitelist.cend(),
