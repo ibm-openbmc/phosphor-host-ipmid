@@ -68,13 +68,11 @@ ipmi::RspType<> ipmiAppResetWatchdogTimer()
     {
         const std::string e_str = std::string("wd_reset: ") + e.what();
         log<level::ERR>(e_str.c_str());
-        reportError();
         return ipmi::responseUnspecifiedError();
     }
     catch (...)
     {
         log<level::ERR>("wd_reset: Unknown Error");
-        reportError();
         return ipmi::responseUnspecifiedError();
     }
 }
@@ -239,13 +237,11 @@ ipmi_ret_t ipmi_app_watchdog_set(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     {
         const std::string e_str = std::string("wd_set: ") + e.what();
         log<level::ERR>(e_str.c_str());
-        reportError();
         return IPMI_CC_UNSPECIFIED_ERROR;
     }
     catch (...)
     {
         log<level::ERR>("wd_set: Unknown Error");
-        reportError();
         return IPMI_CC_UNSPECIFIED_ERROR;
     }
 }
@@ -388,13 +384,11 @@ ipmi_ret_t ipmi_app_watchdog_get(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     {
         const std::string e_str = std::string("wd_get: ") + e.what();
         log<level::ERR>(e_str.c_str());
-        reportError();
         return IPMI_CC_UNSPECIFIED_ERROR;
     }
     catch (...)
     {
         log<level::ERR>("wd_get: Unknown Error");
-        reportError();
         return IPMI_CC_UNSPECIFIED_ERROR;
     }
 }
