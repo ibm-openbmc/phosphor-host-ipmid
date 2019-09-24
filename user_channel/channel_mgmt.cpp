@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <boost/interprocess/sync/scoped_lock.hpp>
+#include <boost/process/child.hpp>
 #include <cerrno>
 #include <exception>
 #include <experimental/filesystem>
@@ -136,6 +137,90 @@ static std::array<std::string, 4> sessionSupportList = {
 static std::array<std::string, PRIVILEGE_OEM + 1> privList = {
     "priv-reserved", "priv-callback", "priv-user",
     "priv-operator", "priv-admin",    "priv-oem"};
+
+template <typename... ArgTypes>
+static int executeCmd(const char* path, ArgTypes&&... tArgs)
+{
+    boost::process::child execProg(path, const_cast<char*>(tArgs)...);
+    execProg.wait();
+    return execProg.exit_code();
+}
+
+/** @brief Enable the network IPMI service on the specified ethernet interface.
+ *
+ *  @param[in] intf - ethernet interface on which to enable IPMI
+ */
+void enableNetworkIPMI(const std::string& intf)
+{
+    // Check if there is a iptable filter to drop IPMI packets for the
+    // interface.
+    auto retCode =
+        executeCmd("/usr/sbin/iptables", "-C", "INPUT", "-p", "udp", "-i",
+                   intf.c_str(), "--dport", "623", "-j", "DROP");
+
+    // If the iptable filter exists, delete the filter.
+    if (!retCode)
+    {
+        auto response =
+            executeCmd("/usr/sbin/iptables", "-D", "INPUT", "-p", "udp", "-i",
+                       intf.c_str(), "--dport", "623", "-j", "DROP");
+        if (response)
+        {
+            log<level::ERR>("Dropping the iptables filter failed",
+                            entry("INTF=%s", intf.c_str()),
+                            entry("RETURN_CODE:%d", response));
+            return;
+        }
+
+        response =
+            std::system("/usr/sbin/iptables-save > /var/lib/iptables_rules");
+        if (response)
+        {
+            log<level::ERR>("Persisting the iptables failed",
+                            entry("INTF=%s", intf.c_str()),
+                            entry("RETURN_CODE=%d", response));
+        }
+    }
+}
+
+/** @brief Disable the network IPMI service on the specified ethernet interface.
+ *
+ *  @param[in] intf - ethernet interface on which to disable IPMI
+ */
+void disableNetworkIPMI(const std::string& intf)
+{
+    // Check if there is a iptable filter to drop IPMI packets for the
+    // interface.
+    auto retCode =
+        executeCmd("/usr/sbin/iptables", "-C", "INPUT", "-p", "udp", "-i",
+                   intf.c_str(), "--dport", "623", "-j", "DROP");
+
+    // If the iptable filter does not exist, add filter to drop network IPMI
+    // packets
+    if (retCode)
+    {
+        auto response =
+            executeCmd("/usr/sbin/iptables", "-I", "INPUT", "-p", "udp", "-i",
+                       intf.c_str(), "--dport", "623", "-j", "DROP");
+        if (response)
+        {
+            log<level::ERR>("Inserting iptables filter failed",
+                            entry("INTF=%s", intf.c_str()),
+                            entry("RETURN_CODE:%d", response));
+            return;
+        }
+
+        response =
+            std::system("/usr/sbin/iptables-save > /var/lib/iptables_rules");
+
+        if (response)
+        {
+            log<level::ERR>("Persisting the iptables failed",
+                            entry("INTF=%s", intf.c_str()),
+                            entry("RETURN_CODE=%d", response));
+        }
+    }
+}
 
 std::string ChannelConfig::getChannelName(const uint8_t chNum)
 {
@@ -583,6 +668,16 @@ ipmi_ret_t ChannelConfig::setChannelAccessPersistData(
     {
         channelData[chNum].chAccess.chNonVolatileData.accessMode =
             chAccessData.accessMode;
+
+        if (convertToAccessModeString(chAccessData.accessMode) == "disabled")
+        {
+            disableNetworkIPMI(channelData[chNum].chName);
+        }
+        else if (convertToAccessModeString(chAccessData.accessMode) ==
+                "always_available")
+        {
+            enableNetworkIPMI(channelData[chNum].chName);
+        }
     }
     if (setFlag & setUserAuthEnabled)
     {
@@ -601,27 +696,6 @@ ipmi_ret_t ChannelConfig::setChannelAccessPersistData(
     }
     if (setFlag & setPrivLimit)
     {
-        // Send Update to network channel config interfaces over dbus
-        std::string privStr = convertToPrivLimitString(chAccessData.privLimit);
-        std::string networkIntfObj = std::string(networkIntfObjectBasePath) +
-                                     "/" + channelData[chNum].chName;
-        try
-        {
-            if (0 != setDbusProperty(networkIntfServiceName, networkIntfObj,
-                                     networkChConfigIntfName,
-                                     privilegePropertyString, privStr))
-            {
-                log<level::DEBUG>(
-                    "Network interface does not exist",
-                    entry("INTERFACE:%s", channelData[chNum].chName.c_str()));
-                return IPMI_CC_UNSPECIFIED_ERROR;
-            }
-        }
-        catch (const sdbusplus::exception::SdBusError& e)
-        {
-            log<level::ERR>("Exception: Network interface does not exist");
-            return IPMI_CC_INVALID_FIELD_REQUEST;
-        }
         signalFlag |= (1 << chNum);
         channelData[chNum].chAccess.chNonVolatileData.privLimit =
             chAccessData.privLimit;
