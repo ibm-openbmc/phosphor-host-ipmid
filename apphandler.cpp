@@ -642,7 +642,7 @@ ipmi::RspType<uint8_t,  // Device ID
                 // byte is IBM's revision 2, the third byte is IBM's extended
                 // version 0 and the fourth byte 0x4F indicates it is an
                 // OpenPower build.
-                devId.aux = 0x4F000214;
+                devId.aux = 0x4F000414;
 
                 // Set the availablitity of the BMC.
                 defaultActivationSetting = data.value("availability", true);
