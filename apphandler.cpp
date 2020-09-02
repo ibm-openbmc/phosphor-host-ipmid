@@ -588,7 +588,6 @@ ipmi::RspType<uint8_t,  // Device ID
               >
     ipmiAppGetDeviceId(ipmi::Context::ptr ctx)
 {
-    int r = -1;
     Revision rev = {0};
     static struct
     {
@@ -609,30 +608,20 @@ ipmi::RspType<uint8_t,  // Device ID
 
     if (!dev_id_initialized)
     {
-        try
-        {
-            auto version = getActiveSoftwareVersionInfo(ctx);
-            r = convertVersion(version, rev);
-        }
-        catch (const std::exception& e)
-        {
-            log<level::ERR>(e.what());
-        }
+        // bit7 identifies if the device is available
+        // 0=normal operation
+        // 1=device firmware, SDR update,
+        // or self-initialization in progress.
+        // The availability may change in run time, so mask here
+        // and initialize later.
+        // The major firmware version is the Power processor version 9
+        devId.fw[0] = 0x09 & ipmiDevIdFw1Mask;
 
-        if (r >= 0)
-        {
-            // bit7 identifies if the device is available
-            // 0=normal operation
-            // 1=device firmware, SDR update,
-            // or self-initialization in progress.
-            // The availability may change in run time, so mask here
-            // and initialize later.
-            devId.fw[0] = rev.major & ipmiDevIdFw1Mask;
-
-            rev.minor = (rev.minor > 99 ? 99 : rev.minor);
-            devId.fw[1] = rev.minor % 10 + (rev.minor / 10) * 16;
-            std::memcpy(&devId.aux, rev.d, 4);
-        }
+        // The minor firmware version is the IBM major release version
+        // For OP940, 40 is the minor version
+        rev.minor = 40;
+        devId.fw[1] = rev.minor % 10 + (rev.minor / 10) * 16;
+        std::memcpy(&devId.aux, rev.d, 4);
 
         // IPMI Spec version 2.0
         devId.ipmiVer = 2;
@@ -648,7 +637,12 @@ ipmi::RspType<uint8_t,  // Device ID
                 devId.addnDevSupport = data.value("addn_dev_support", 0);
                 devId.manufId = data.value("manuf_id", 0);
                 devId.prodId = data.value("prod_id", 0);
-                devId.aux = data.value("aux", 0);
+                // For VERSION_ID = op940.20-2-0-g414986cad the first byte in
+                // the auxiliary version is Service Pack version 20, the second
+                // byte is IBM's revision 2, the third byte is IBM's extended
+                // version 0 and the fourth byte 0x4F indicates it is an
+                // OpenPower build.
+                devId.aux = 0x4F000214;
 
                 // Set the availablitity of the BMC.
                 defaultActivationSetting = data.value("availability", true);
