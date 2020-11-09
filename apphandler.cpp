@@ -642,7 +642,10 @@ ipmi::RspType<uint8_t,  // Device ID
                 // byte is IBM's revision 2, the third byte is IBM's extended
                 // version 0 and the fourth byte 0x4F indicates it is an
                 // OpenPower build.
-                devId.aux = 0x4F000914;
+                // The major and minor firmware revision will be BCD encoded as
+                // mentioned in the IPMI specification. For auxiliary firmware
+                // bytes: bytes will be stored as hex in the command response.
+                devId.aux = 0x4F000A14;
 
                 // Set the availablitity of the BMC.
                 defaultActivationSetting = data.value("availability", true);
