@@ -645,7 +645,7 @@ ipmi::RspType<uint8_t,  // Device ID
                 // The major and minor firmware revision will be BCD encoded as
                 // mentioned in the IPMI specification. For auxiliary firmware
                 // bytes: bytes will be stored as hex in the command response.
-                devId.aux = 0x4F000A14;
+                devId.aux = 0x4F000B14;
 
                 // Set the availablitity of the BMC.
                 defaultActivationSetting = data.value("availability", true);
