@@ -101,11 +101,11 @@ static constexpr const char* userGrpProperty = "UserGroups";
 static constexpr const char* userEnabledProperty = "UserEnabled";
 
 static std::array<std::string, (PRIVILEGE_OEM + 1)> ipmiPrivIndex = {
-    "priv-reserved", // PRIVILEGE_RESERVED - 0
-    "priv-callback", // PRIVILEGE_CALLBACK - 1
-    "priv-user",     // PRIVILEGE_USER - 2
-    "priv-operator", // PRIVILEGE_OPERATOR - 3
-    "priv-admin",    // PRIVILEGE_ADMIN - 4
+    "priv-reserved",          // PRIVILEGE_RESERVED - 0
+    "priv-callback",          // PRIVILEGE_CALLBACK - 1
+    "priv-user",              // PRIVILEGE_USER - 2
+    "priv-operator",          // PRIVILEGE_OPERATOR - 3
+    "priv-admin",             // PRIVILEGE_ADMIN - 4
     "priv-oemibmserviceagent" // PRIVILEGE_OEM - 5
 };
 
