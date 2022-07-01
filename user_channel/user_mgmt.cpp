@@ -1049,6 +1049,17 @@ Cc UserAccess::setUserName(const uint8_t userId, const std::string& userName)
             {
                 return ccUnspecifiedError;
             }
+
+            // Remove ssh group, appplies to all user accounts created
+            // irrespective of privilege
+            std::string sshGroup = "ssh";
+            auto it = std::find(std::begin(availableGroups),
+                                std::end(availableGroups), sshGroup);
+            if (it != std::end(availableGroups))
+            {
+                availableGroups.erase(it);
+            }
+
             // Create new user
             auto method = bus.new_method_call(
                 getUserServiceName().c_str(), userMgrObjBasePath,
