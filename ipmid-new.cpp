@@ -21,7 +21,6 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/asio/io_context.hpp>
-#include <dcmihandler.hpp>
 #include <host-cmd-manager.hpp>
 #include <ipmid-host/cmd.hpp>
 #include <ipmid/api.hpp>
@@ -373,7 +372,7 @@ void updateOwners(sdbusplus::asio::connection& conn, const std::string& name)
             log<level::INFO>("Failed interface mapping, no such name",
                              entry("INTERFACE=%s", name.c_str()));
         }
-        },
+    },
         "org.freedesktop.DBus", "/", "org.freedesktop.DBus", "GetNameOwner",
         name);
 }
@@ -401,7 +400,7 @@ void doListNames(boost::asio::io_context& io, sdbusplus::asio::connection& conn)
                 updateOwners(conn, busName);
             }
         }
-        },
+    },
         "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
         "ListNames");
 }
@@ -712,8 +711,8 @@ void ipmi_register_callback(ipmi_netfn_t netFn, ipmi_cmd_t cmd,
     // all the handlers were part of the DCMI group, so default to that.
     if (netFn == NETFUN_GRPEXT)
     {
-        ipmi::impl::registerGroupHandler(ipmi::prioOpenBmcBase,
-                                         dcmi::groupExtId, cmd, realPriv, h);
+        ipmi::impl::registerGroupHandler(ipmi::prioOpenBmcBase, ipmi::groupDCMI,
+                                         cmd, realPriv, h);
     }
     else
     {
