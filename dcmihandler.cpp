@@ -387,12 +387,12 @@ ipmi::RspType<uint16_t, // reserved
      */
     constexpr uint32_t correctionTime{};
     constexpr uint16_t statsPeriod{};
-    if (!pcapEnable)
+    if (*pcapEnable == false)
     {
         constexpr ipmi::Cc responseNoPowerLimitSet = 0x80;
-        constexpr uint16_t noPcap{};
         return ipmi::response(responseNoPowerLimitSet, reserved1, exception,
-                              noPcap, correctionTime, reserved2, statsPeriod);
+                              *pcapValue, correctionTime, reserved2,
+                              statsPeriod);
     }
     return ipmi::responseSuccess(reserved1, exception, *pcapValue,
                                  correctionTime, reserved2, statsPeriod);
