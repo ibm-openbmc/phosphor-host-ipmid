@@ -1089,6 +1089,15 @@ int ChannelConfig::readChannelPersistData()
         lg2::debug("Error in opening IPMI Channel data file");
         return -EIO;
     }
+    else if (!std::filesystem::file_size(channelNvDataFilename))
+    {
+        log<level::DEBUG>("NV file (channelNvDataFilename) has a size of zero");
+        if (std::filesystem::remove(channelNvDataFilename))
+        {
+            log<level::DEBUG>("NV file (channelNvDataFilename) is deleted");
+        }
+        return -EIO;
+    }
     try
     {
         // Fill in global structure
