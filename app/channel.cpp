@@ -1,22 +1,22 @@
 #include "channel.hpp"
 
-#include "transporthandler.hpp"
 #include "user_channel/channel_layer.hpp"
 
 #include <arpa/inet.h>
 
 #include <boost/process/child.hpp>
-#include <fstream>
 #include <ipmid/types.hpp>
 #include <ipmid/utils.hpp>
 #include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
-#include <set>
-#include <string>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
 
+#include <fstream>
+#include <set>
+#include <string>
+
 using namespace phosphor::logging;
-using namespace sdbusplus::xyz::openbmc_project::Common::Error;
+using namespace sdbusplus::error::xyz::openbmc_project::common;
 
 namespace cipher
 {
@@ -43,14 +43,14 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> getCipherRecords()
     std::ifstream jsonFile(configFile);
     if (!jsonFile.is_open())
     {
-        log<level::ERR>("Channel Cipher suites file not found");
+        lg2::error("Channel Cipher suites file not found");
         elog<InternalFailure>();
     }
 
     auto data = Json::parse(jsonFile, nullptr, false);
     if (data.is_discarded())
     {
-        log<level::ERR>("Parsing channel cipher suites JSON failed");
+        lg2::error("Parsing channel cipher suites JSON failed");
         elog<InternalFailure>();
     }
 
@@ -97,26 +97,44 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> getCipherRecords()
 
 } // namespace cipher
 
-ipmi_ret_t getChannelCipherSuites(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                  ipmi_request_t request,
-                                  ipmi_response_t response,
-                                  ipmi_data_len_t data_len,
-                                  ipmi_context_t context)
+/** @brief this command is used to look up what authentication, integrity,
+ *  confidentiality algorithms are supported.
+ *
+ *  @ param ctx - context pointer
+ *  @ param channelNumber - channel number
+ *  @ param payloadType - payload type
+ *  @ param listIndex - list index
+ *  @ param algoSelectBit - list algorithms
+ *
+ *  @returns ipmi completion code plus response data
+ *  - rspChannel - channel number for authentication algorithm.
+ *  - rspRecords - cipher suite records.
+ **/
+ipmi::RspType<uint8_t,             // Channel Number
+              std::vector<uint8_t> // Cipher Records
+              >
+    getChannelCipherSuites(ipmi::Context::ptr ctx, uint4_t channelNumber,
+                           uint4_t reserved1, uint8_t payloadType,
+                           uint6_t listIndex, uint1_t reserved2,
+                           uint1_t algoSelectBit)
 {
     static std::vector<uint8_t> cipherRecords;
     static std::vector<uint8_t> supportedAlgorithms;
     static auto recordInit = false;
 
-    auto requestData =
-        reinterpret_cast<const GetChannelCipherRequest*>(request);
+    uint8_t rspChannel = ipmi::convertCurrentChannelNum(
+        static_cast<uint8_t>(channelNumber), ctx->channel);
 
-    if (*data_len < sizeof(GetChannelCipherRequest))
+    if (!ipmi::isValidChannel(rspChannel) || reserved1 != 0 || reserved2 != 0)
     {
-        *data_len = 0;
-        return IPMI_CC_REQ_DATA_LEN_INVALID;
+        return ipmi::responseInvalidFieldRequest();
     }
-
-    *data_len = 0;
+    if (!ipmi::isValidPayloadType(static_cast<ipmi::PayloadType>(payloadType)))
+    {
+        lg2::debug("Get channel cipher suites - Invalid payload type");
+        constexpr uint8_t ccPayloadTypeNotSupported = 0x80;
+        return ipmi::response(ccPayloadTypeNotSupported);
+    }
 
     if (!recordInit)
     {
@@ -128,104 +146,35 @@ ipmi_ret_t getChannelCipherSuites(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
         }
         catch (const std::exception& e)
         {
-            return IPMI_CC_UNSPECIFIED_ERROR;
+            return ipmi::responseUnspecifiedError();
         }
     }
 
-    const auto& records = (cipher::listCipherSuite ==
-                           (requestData->listIndex & cipher::listTypeMask))
-                              ? cipherRecords
-                              : supportedAlgorithms;
+    const std::vector<uint8_t>& records =
+        algoSelectBit ? cipherRecords : supportedAlgorithms;
+    static constexpr auto respSize = 16;
+
+    // Session support is available in active LAN channels.
+    if ((ipmi::getChannelSessionSupport(rspChannel) ==
+         ipmi::EChannelSessSupported::none) ||
+        !(ipmi::doesDeviceExist(rspChannel)))
+    {
+        lg2::debug("Get channel cipher suites - Device does not exist");
+        return ipmi::responseInvalidFieldRequest();
+    }
 
     // List index(00h-3Fh), 0h selects the first set of 16, 1h selects the next
     // set of 16 and so on.
-    auto index =
-        static_cast<size_t>(requestData->listIndex & cipher::listIndexMask);
 
     // Calculate the number of record data bytes to be returned.
-    auto start = std::min(index * cipher::respSize, records.size());
-    auto end =
-        std::min((index * cipher::respSize) + cipher::respSize, records.size());
+    auto start =
+        std::min(static_cast<size_t>(listIndex) * respSize, records.size());
+    auto end = std::min((static_cast<size_t>(listIndex) * respSize) + respSize,
+                        records.size());
     auto size = end - start;
 
-    auto responseData = reinterpret_cast<GetChannelCipherRespHeader*>(response);
-    responseData->channelNumber = cipher::defaultChannelNumber;
+    std::vector<uint8_t> rspRecords;
+    std::copy_n(records.data() + start, size, std::back_inserter(rspRecords));
 
-    if (!size)
-    {
-        *data_len = sizeof(GetChannelCipherRespHeader);
-    }
-    else
-    {
-        std::copy_n(records.data() + start, size,
-                    static_cast<uint8_t*>(response) + 1);
-        *data_len = size + sizeof(GetChannelCipherRespHeader);
-    }
-
-    return IPMI_CC_OK;
-}
-
-template <typename... ArgTypes>
-static int executeCmd(const char* path, ArgTypes&&... tArgs)
-{
-    boost::process::child execProg(path, const_cast<char*>(tArgs)...);
-    execProg.wait();
-    return execProg.exit_code();
-}
-
-/** @brief Enable the network IPMI service on the specified ethernet interface.
- *
- *  @param[in] intf - ethernet interface on which to enable IPMI
- */
-void enableNetworkIPMI(const std::string& intf)
-{
-    // Check if there is a iptable filter to drop IPMI packets for the
-    // interface.
-    auto retCode =
-        executeCmd("/usr/sbin/iptables", "-C", "INPUT", "-p", "udp", "-i",
-                   intf.c_str(), "--dport", "623", "-j", "DROP");
-
-    // If the iptable filter exists, delete the filter.
-    if (!retCode)
-    {
-        auto response =
-            executeCmd("/usr/sbin/iptables", "-D", "INPUT", "-p", "udp", "-i",
-                       intf.c_str(), "--dport", "623", "-j", "DROP");
-
-        if (response)
-        {
-            log<level::ERR>("Dropping the iptables filter failed",
-                            entry("INTF=%s", intf.c_str()),
-                            entry("RETURN_CODE:%d", response));
-        }
-    }
-}
-
-/** @brief Disable the network IPMI service on the specified ethernet interface.
- *
- *  @param[in] intf - ethernet interface on which to disable IPMI
- */
-void disableNetworkIPMI(const std::string& intf)
-{
-    // Check if there is a iptable filter to drop IPMI packets for the
-    // interface.
-    auto retCode =
-        executeCmd("/usr/sbin/iptables", "-C", "INPUT", "-p", "udp", "-i",
-                   intf.c_str(), "--dport", "623", "-j", "DROP");
-
-    // If the iptable filter does not exist, add filter to drop network IPMI
-    // packets
-    if (retCode)
-    {
-        auto response =
-            executeCmd("/usr/sbin/iptables", "-I", "INPUT", "-p", "udp", "-i",
-                       intf.c_str(), "--dport", "623", "-j", "DROP");
-
-        if (response)
-        {
-            log<level::ERR>("Inserting iptables filter failed",
-                            entry("INTF=%s", intf.c_str()),
-                            entry("RETURN_CODE:%d", response));
-        }
-    }
+    return ipmi::responseSuccess(rspChannel, rspRecords);
 }

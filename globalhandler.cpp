@@ -2,25 +2,23 @@
 
 #include <ipmid/api.hpp>
 #include <ipmid/utils.hpp>
-#include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
-#include <string>
-#include <xyz/openbmc_project/Common/error.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/State/BMC/server.hpp>
+
+#include <string>
 
 static constexpr auto bmcStateRoot = "/xyz/openbmc_project/state";
 static constexpr auto bmcStateIntf = "xyz.openbmc_project.State.BMC";
 static constexpr auto reqTransition = "RequestedBMCTransition";
 static constexpr auto match = "bmc0";
 
-using namespace phosphor::logging;
-using BMC = sdbusplus::xyz::openbmc_project::State::server::BMC;
+using BMC = sdbusplus::server::xyz::openbmc_project::state::BMC;
 
 void register_netfn_global_functions() __attribute__((constructor));
 
 void resetBMC()
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
 
     auto bmcStateObj =
         ipmi::getDbusObject(bus, bmcStateIntf, bmcStateRoot, match);
@@ -42,9 +40,9 @@ ipmi::RspType<> ipmiGlobalReset()
     {
         resetBMC();
     }
-    catch (std::exception& e)
+    catch (const std::exception& e)
     {
-        log<level::ERR>(e.what());
+        lg2::error("Exception in Global Reset: {ERROR}", "ERROR", e);
         return ipmi::responseUnspecifiedError();
     }
 
@@ -54,7 +52,6 @@ ipmi::RspType<> ipmiGlobalReset()
 
 void register_netfn_global_functions()
 {
-
     // Cold Reset
     ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnApp,
                           ipmi::app::cmdColdReset, ipmi::Privilege::Admin,

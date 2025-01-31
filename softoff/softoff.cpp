@@ -17,17 +17,17 @@
 
 #include "softoff.hpp"
 
-#include <chrono>
 #include <ipmid/utils.hpp>
-#include <phosphor-logging/log.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <xyz/openbmc_project/Control/Host/server.hpp>
+
+#include <chrono>
 namespace phosphor
 {
 namespace ipmi
 {
 
-using namespace phosphor::logging;
-using namespace sdbusplus::xyz::openbmc_project::Control::server;
+using namespace sdbusplus::server::xyz::openbmc_project::control;
 
 void SoftPowerOff::sendHostShutDownCmd()
 {
@@ -40,34 +40,35 @@ void SoftPowerOff::sendHostShutDownCmd()
                                       CONTROL_HOST_BUSNAME, "Execute");
 
     method.append(convertForMessage(Host::Command::SoftOff).c_str());
-
-    auto reply = bus.call(method);
-    if (reply.is_method_error())
+    try
     {
-        log<level::ERR>("Error in call to control host Execute");
+        auto reply = bus.call(method);
+    }
+    catch (const std::exception& e)
+    {
+        lg2::error("Error in call to control host Execute: {ERROR}", "ERROR",
+                   e);
         // TODO openbmc/openbmc#851 - Once available, throw returned error
         throw std::runtime_error("Error in call to control host Execute");
     }
-
-    return;
 }
 
 // Function called on host control signals
-void SoftPowerOff::hostControlEvent(sdbusplus::message::message& msg)
+void SoftPowerOff::hostControlEvent(sdbusplus::message_t& msg)
 {
     std::string cmdCompleted{};
     std::string cmdStatus{};
 
     msg.read(cmdCompleted, cmdStatus);
 
-    log<level::DEBUG>("Host control signal values",
-                      entry("COMMAND=%s", cmdCompleted.c_str()),
-                      entry("STATUS=%s", cmdStatus.c_str()));
+    lg2::debug(
+        "Host control signal values, command: {COMMAND}, status:{STATUS}",
+        "COMMAND", cmdCompleted, "STATUS", cmdStatus);
 
     if (Host::convertResultFromString(cmdStatus) == Host::Result::Success)
     {
         // Set our internal property indicating we got host attention
-        sdbusplus::xyz::openbmc_project::Ipmi::Internal ::server::SoftPowerOff::
+        sdbusplus::server::xyz::openbmc_project::ipmi::internal::SoftPowerOff::
             responseReceived(HostResponse::SoftOffReceived);
 
         // Start timer for host shutdown
@@ -77,24 +78,25 @@ void SoftPowerOff::hostControlEvent(sdbusplus::message::message& msg)
         auto r = startTimer(time);
         if (r < 0)
         {
-            log<level::ERR>("Failure to start Host shutdown wait timer",
-                            entry("ERRNO=0x%X", -r));
+            lg2::error(
+                "Failure to start Host shutdown wait timer, ERRNO: {ERRNO}",
+                "ERRNO", lg2::hex, -r);
         }
         else
         {
-            log<level::INFO>(
-                "Timer started waiting for host to shutdown",
-                entry("TIMEOUT_IN_MSEC=%llu",
+            lg2::info("Timer started waiting for host to shutdown, "
+                      "TIMEOUT_IN_MSEC: {TIMEOUT_IN_MSEC}",
+                      "TIMEOUT_IN_MSEC",
                       (duration_cast<milliseconds>(
                            seconds(IPMI_HOST_SHUTDOWN_COMPLETE_TIMEOUT_SECS)))
-                          .count()));
+                          .count());
         }
     }
     else
     {
         // An error on the initial attention is not considered an error, just
         // exit normally and allow remaining shutdown targets to run
-        log<level::INFO>("Timeout on host attention, continue with power down");
+        lg2::info("Timeout on host attention, continue with power down");
         completed = true;
     }
     return;
@@ -118,15 +120,15 @@ auto SoftPowerOff::responseReceived(HostResponse response) -> HostResponse
         auto r = timer.stop();
         if (r < 0)
         {
-            log<level::ERR>("Failure to STOP the timer",
-                            entry("ERRNO=0x%X", -r));
+            lg2::error("Failure to STOP the timer, ERRNO: {ERRNO}", "ERRNO",
+                       lg2::hex, -r);
         }
 
         // This marks the completion of soft power off sequence.
         completed = true;
     }
 
-    return sdbusplus::xyz::openbmc_project::Ipmi::Internal ::server::
+    return sdbusplus::server::xyz::openbmc_project::ipmi::internal::
         SoftPowerOff::responseReceived(response);
 }
 

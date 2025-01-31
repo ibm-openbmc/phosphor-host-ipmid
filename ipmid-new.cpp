@@ -19,13 +19,8 @@
 
 #include <dlfcn.h>
 
-#include <algorithm>
-#include <any>
 #include <boost/algorithm/string.hpp>
-#include <dcmihandler.hpp>
-#include <exception>
-#include <filesystem>
-#include <forward_list>
+#include <boost/asio/io_context.hpp>
 #include <host-cmd-manager.hpp>
 #include <ipmid-host/cmd.hpp>
 #include <ipmid/api.hpp>
@@ -33,16 +28,21 @@
 #include <ipmid/message.hpp>
 #include <ipmid/oemrouter.hpp>
 #include <ipmid/types.hpp>
-#include <map>
-#include <memory>
-#include <optional>
-#include <phosphor-logging/log.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/asio/connection.hpp>
 #include <sdbusplus/asio/object_server.hpp>
-#include <sdbusplus/asio/sd_event.hpp>
 #include <sdbusplus/bus.hpp>
 #include <sdbusplus/bus/match.hpp>
 #include <sdbusplus/timer.hpp>
+
+#include <algorithm>
+#include <any>
+#include <exception>
+#include <filesystem>
+#include <forward_list>
+#include <map>
+#include <memory>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -84,11 +84,6 @@ EInterfaceIndex getInterfaceIndex(void)
 }
 
 sd_bus* bus;
-sd_event* events = nullptr;
-sd_event* ipmid_get_sd_event_connection(void)
-{
-    return events;
-}
 sd_bus* ipmid_get_sd_bus_connection(void)
 {
     return bus;
@@ -186,8 +181,15 @@ bool registerOemHandler(int prio, Iana iana, Cmd cmd, Privilege priv,
     if (!std::get<HandlerBase::ptr>(mapCmd) || std::get<int>(mapCmd) <= prio)
     {
         mapCmd = item;
+        lg2::debug("registered OEM Handler: NetFn/Cmd={NETFNCMD}", "IANA",
+                   lg2::hex, iana, "CMD", lg2::hex, cmd, "NETFNCMD", lg2::hex,
+                   netFnCmd);
         return true;
     }
+
+    lg2::warning("could not register OEM Handler: NetFn/Cmd={NETFNCMD}", "IANA",
+                 lg2::hex, iana, "CMD", lg2::hex, cmd, "NETFNCMD", lg2::hex,
+                 netFnCmd);
     return false;
 }
 
@@ -198,6 +200,7 @@ void registerFilter(int prio, FilterBase::ptr filter)
     if (filterList.empty() || std::get<int>(filterList.front()) < prio)
     {
         filterList.emplace_front(std::make_tuple(prio, filter));
+        return;
     }
     // walk the list and put it in the right place
     auto j = filterList.begin();
@@ -233,17 +236,20 @@ message::Response::ptr executeIpmiCommandCommon(
 {
     // filter the command first; a non-null message::Response::ptr
     // means that the message has been rejected for some reason
-    message::Response::ptr response = filterIpmiCommand(request);
-    if (response)
-    {
-        return response;
-    }
+    message::Response::ptr filterResponse = filterIpmiCommand(request);
 
     Cmd cmd = request->ctx->cmd;
     unsigned int key = makeCmdKey(keyCommon, cmd);
     auto cmdIter = handlers.find(key);
     if (cmdIter != handlers.end())
     {
+        // only return the filter response if the command is found
+        if (filterResponse)
+        {
+            lg2::debug("request for NetFn/Cmd {NETFN}/{CMD} has been filtered",
+                       "NETFN", lg2::hex, keyCommon, "CMD", lg2::hex, cmd);
+            return filterResponse;
+        }
         HandlerTuple& chosen = cmdIter->second;
         if (request->ctx->priv < std::get<Privilege>(chosen))
         {
@@ -257,6 +263,14 @@ message::Response::ptr executeIpmiCommandCommon(
         cmdIter = handlers.find(wildcard);
         if (cmdIter != handlers.end())
         {
+            // only return the filter response if the command is found
+            if (filterResponse)
+            {
+                lg2::debug(
+                    "request for NetFn/Cmd {NETFN}/{CMD} has been filtered",
+                    "NETFN", lg2::hex, keyCommon, "CMD", lg2::hex, cmd);
+                return filterResponse;
+            }
             HandlerTuple& chosen = cmdIter->second;
             if (request->ctx->priv < std::get<Privilege>(chosen))
             {
@@ -294,6 +308,9 @@ message::Response::ptr executeIpmiOemCommand(message::Request::ptr request)
         return errorResponse(request, ccReqDataLenInvalid);
     }
     auto iana = static_cast<Iana>(bytes);
+
+    lg2::debug("unpack IANA {IANA}", "IANA", lg2::hex, iana);
+
     message::Response::ptr response =
         executeIpmiCommandCommon(oemHandlerMap, iana, request);
     ipmi::message::Payload prefix;
@@ -345,8 +362,8 @@ void updateOwners(sdbusplus::asio::connection& conn, const std::string& name)
                const std::string& nameOwner) {
             if (ec)
             {
-                log<level::ERR>("Error getting dbus owner",
-                                entry("INTERFACE=%s", name.c_str()));
+                lg2::error("Error getting dbus owner for {INTERFACE}",
+                           "INTERFACE", name);
                 return;
             }
             // start after ipmiDbusChannelPrefix (after the '.')
@@ -356,28 +373,29 @@ void updateOwners(sdbusplus::asio::connection& conn, const std::string& name)
             {
                 uint8_t channel = getChannelByName(chName);
                 uniqueNameToChannelNumber[nameOwner] = channel;
-                log<level::INFO>("New interface mapping",
-                                 entry("INTERFACE=%s", name.c_str()),
-                                 entry("CHANNEL=%u", channel));
+                lg2::info(
+                    "New interface mapping: {INTERFACE} -> channel {CHANNEL}",
+                    "INTERFACE", name, "CHANNEL", channel);
             }
             catch (const std::exception& e)
             {
-                log<level::INFO>("Failed interface mapping, no such name",
-                                 entry("INTERFACE=%s", name.c_str()));
+                lg2::info("Failed interface mapping, no such name: {INTERFACE}",
+                          "INTERFACE", name);
             }
         },
         "org.freedesktop.DBus", "/", "org.freedesktop.DBus", "GetNameOwner",
         name);
 }
 
-void doListNames(boost::asio::io_service& io, sdbusplus::asio::connection& conn)
+void doListNames(boost::asio::io_context& io, sdbusplus::asio::connection& conn)
 {
     conn.async_method_call(
         [&io, &conn](const boost::system::error_code ec,
                      std::vector<std::string> busNames) {
             if (ec)
             {
-                log<level::ERR>("Error getting dbus names");
+                lg2::error("Error getting dbus names: {ERROR}", "ERROR",
+                           ec.message());
                 std::exit(EXIT_FAILURE);
                 return;
             }
@@ -398,7 +416,7 @@ void doListNames(boost::asio::io_service& io, sdbusplus::asio::connection& conn)
         "ListNames");
 }
 
-void nameChangeHandler(sdbusplus::message::message& message)
+void nameChangeHandler(sdbusplus::message_t& message)
 {
     std::string name;
     std::string oldOwner;
@@ -426,14 +444,13 @@ void nameChangeHandler(sdbusplus::message::message& message)
         {
             uint8_t channel = getChannelByName(chName);
             uniqueNameToChannelNumber[newOwner] = channel;
-            log<level::INFO>("New interface mapping",
-                             entry("INTERFACE=%s", name.c_str()),
-                             entry("CHANNEL=%u", channel));
+            lg2::info("New interface mapping: {INTERFACE} -> channel {CHANNEL}",
+                      "INTERFACE", name, "CHANNEL", channel);
         }
         catch (const std::exception& e)
         {
-            log<level::INFO>("Failed interface mapping, no such name",
-                             entry("INTERFACE=%s", name.c_str()));
+            lg2::info("Failed interface mapping, no such name: {INTERFACE}",
+                      "INTERFACE", name);
         }
     }
 };
@@ -441,7 +458,7 @@ void nameChangeHandler(sdbusplus::message::message& message)
 } // anonymous namespace
 
 static constexpr const char intraBmcName[] = "INTRABMC";
-uint8_t channelFromMessage(sdbusplus::message::message& msg)
+uint8_t channelFromMessage(sdbusplus::message_t& msg)
 {
     // channel name for ipmitool to resolve to
     std::string sender = msg.get_sender();
@@ -462,13 +479,12 @@ uint8_t channelFromMessage(sdbusplus::message::message& msg)
 } // namespace ipmi
 
 /* called from sdbus async server context */
-auto executionEntry(boost::asio::yield_context yield,
-                    sdbusplus::message::message& m, NetFn netFn, uint8_t lun,
-                    Cmd cmd, std::vector<uint8_t>& data,
+auto executionEntry(boost::asio::yield_context yield, sdbusplus::message_t& m,
+                    NetFn netFn, uint8_t lun, Cmd cmd, ipmi::SecureBuffer& data,
                     std::map<std::string, ipmi::Value>& options)
 {
     const auto dbusResponse =
-        [netFn, lun, cmd](Cc cc, const std::vector<uint8_t>& data = {}) {
+        [netFn, lun, cmd](Cc cc, const ipmi::SecureBuffer& data = {}) {
             constexpr uint8_t netFnResponse = 0x01;
             uint8_t retNetFn = netFn | netFnResponse;
             return std::make_tuple(retNetFn, lun, cmd, cc, data);
@@ -476,34 +492,42 @@ auto executionEntry(boost::asio::yield_context yield,
     std::string sender = m.get_sender();
     Privilege privilege = Privilege::None;
     int rqSA = 0;
+    int hostIdx = 0;
     uint8_t userId = 0; // undefined user
+    uint32_t sessionId = 0;
 
     // figure out what channel the request came in on
     uint8_t channel = channelFromMessage(m);
     if (channel == invalidChannel)
     {
         // unknown sender channel; refuse to service the request
-        log<level::ERR>("ERROR determining source IPMI channel",
-                        entry("SENDER=%s", sender.c_str()),
-                        entry("NETFN=0x%X", netFn), entry("CMD=0x%X", cmd));
+        lg2::error("ERROR determining source IPMI channel from "
+                   "{SENDER} NetFn/Cmd {NETFN}/{CMD}",
+                   "SENDER", sender, "NETFN", lg2::hex, netFn, "CMD", lg2::hex,
+                   cmd);
         return dbusResponse(ipmi::ccDestinationUnavailable);
     }
 
-    // session-based channels are required to provide userId/privilege
+    // session-based channels are required to provide userId, privilege and
+    // sessionId
     if (getChannelSessionSupport(channel) != EChannelSessSupported::none)
     {
         try
         {
             Value requestPriv = options.at("privilege");
             Value requestUserId = options.at("userId");
+            Value requestSessionId = options.at("currentSessionId");
             privilege = static_cast<Privilege>(std::get<int>(requestPriv));
             userId = static_cast<uint8_t>(std::get<int>(requestUserId));
+            sessionId =
+                static_cast<uint32_t>(std::get<uint32_t>(requestSessionId));
         }
         catch (const std::exception& e)
         {
-            log<level::ERR>("ERROR determining IPMI session credentials",
-                            entry("CHANNEL=%u", channel),
-                            entry("NETFN=0x%X", netFn), entry("CMD=0x%X", cmd));
+            lg2::error("ERROR determining IPMI session credentials on "
+                       "channel {CHANNEL} for userid {USERID}",
+                       "CHANNEL", channel, "USERID", userId, "NETFN", lg2::hex,
+                       netFn, "CMD", lg2::hex, cmd);
             return dbusResponse(ipmi::ccUnspecifiedError);
         }
     }
@@ -527,19 +551,28 @@ auto executionEntry(boost::asio::yield_context yield,
                     rqSA = std::get<int>(iter->second);
                 }
             }
+            const auto iteration = options.find("hostId");
+            if (iteration != options.end())
+            {
+                if (std::holds_alternative<int>(iteration->second))
+                {
+                    hostIdx = std::get<int>(iteration->second);
+                }
+            }
         }
     }
     // check to see if the requested priv/username is valid
-    log<level::DEBUG>("Set up ipmi context", entry("SENDER=%s", sender.c_str()),
-                      entry("NETFN=0x%X", netFn), entry("CMD=0x%X", cmd),
-                      entry("CHANNEL=%u", channel), entry("USERID=%u", userId),
-                      entry("PRIVILEGE=%u", static_cast<uint8_t>(privilege)),
-                      entry("RQSA=%x", rqSA));
+    lg2::debug("Set up ipmi context: Ch:NetFn/Cmd={CHANNEL}:{NETFN}/{CMD}",
+               "SENDER", sender, "NETFN", lg2::hex, netFn, "LUN", lg2::hex, lun,
+               "CMD", lg2::hex, cmd, "CHANNEL", channel, "USERID", userId,
+               "SESSIONID", lg2::hex, sessionId, "PRIVILEGE",
+               static_cast<uint8_t>(privilege), "RQSA", lg2::hex, rqSA);
 
-    auto ctx = std::make_shared<ipmi::Context>(netFn, cmd, channel, userId,
-                                               privilege, rqSA, &yield);
+    auto ctx = std::make_shared<ipmi::Context>(
+        getSdBus(), netFn, lun, cmd, channel, userId, sessionId, privilege,
+        rqSA, hostIdx, yield);
     auto request = std::make_shared<ipmi::message::Request>(
-        ctx, std::forward<std::vector<uint8_t>>(data));
+        ctx, std::forward<ipmi::SecureBuffer>(data));
     message::Response::ptr response = executeIpmiCommand(request);
 
     return dbusResponse(response->cc, response->payload.raw);
@@ -567,37 +600,26 @@ struct IpmiProvider
      */
     explicit IpmiProvider(const char* fname) : addr(nullptr), name(fname)
     {
-        log<level::DEBUG>("Open IPMI provider library",
-                          entry("PROVIDER=%s", name.c_str()));
+        lg2::debug("Open IPMI provider library: {PROVIDER}", "PROVIDER", name);
         try
         {
             addr = dlopen(name.c_str(), RTLD_NOW);
         }
-        catch (std::exception& e)
+        catch (const std::exception& e)
         {
-            log<level::ERR>("ERROR opening IPMI provider",
-                            entry("PROVIDER=%s", name.c_str()),
-                            entry("ERROR=%s", e.what()));
+            lg2::error("ERROR opening IPMI provider {PROVIDER}: {ERROR}",
+                       "PROVIDER", name, "ERROR", e);
         }
         catch (...)
         {
-            std::exception_ptr eptr = std::current_exception();
-            try
-            {
-                std::rethrow_exception(eptr);
-            }
-            catch (std::exception& e)
-            {
-                log<level::ERR>("ERROR opening IPMI provider",
-                                entry("PROVIDER=%s", name.c_str()),
-                                entry("ERROR=%s", e.what()));
-            }
+            const char* what = currentExceptionType();
+            lg2::error("ERROR opening IPMI provider {PROVIDER}: {ERROR}",
+                       "PROVIDER", name, "ERROR", what);
         }
         if (!isOpen())
         {
-            log<level::ERR>("ERROR opening IPMI provider",
-                            entry("PROVIDER=%s", name.c_str()),
-                            entry("ERROR=%s", dlerror()));
+            lg2::error("ERROR opening IPMI provider {PROVIDER}: {ERROR}",
+                       "PROVIDER", name, "ERROR", dlerror());
         }
     }
 
@@ -647,8 +669,7 @@ std::forward_list<IpmiProvider> loadProviders(const fs::path& ipmiLibsPath)
     for (auto& lib : libs)
     {
 #ifdef __IPMI_DEBUG__
-        log<level::DEBUG>("Registering handler",
-                          entry("HANDLER=%s", lib.c_str()));
+        lg2::debug("Registering handler {HANDLER}", "HANDLER", lib);
 #endif
         handles.emplace_front(lib.c_str());
     }
@@ -695,8 +716,8 @@ void ipmi_register_callback(ipmi_netfn_t netFn, ipmi_cmd_t cmd,
     // all the handlers were part of the DCMI group, so default to that.
     if (netFn == NETFUN_GRPEXT)
     {
-        ipmi::impl::registerGroupHandler(ipmi::prioOpenBmcBase,
-                                         dcmi::groupExtId, cmd, realPriv, h);
+        ipmi::impl::registerGroupHandler(ipmi::prioOpenBmcBase, ipmi::groupDCMI,
+                                         cmd, realPriv, h);
     }
     else
     {
@@ -711,14 +732,10 @@ namespace oem
 class LegacyRouter : public oem::Router
 {
   public:
-    virtual ~LegacyRouter()
-    {
-    }
+    virtual ~LegacyRouter() {}
 
     /// Enable message routing to begin.
-    void activate() override
-    {
-    }
+    void activate() override {}
 
     void registerHandler(Number oen, ipmi_cmd_t cmd, Handler handler) override
     {
@@ -737,44 +754,48 @@ Router* mutableRouter()
 } // namespace oem
 
 /* legacy alternative to executionEntry */
-void handleLegacyIpmiCommand(sdbusplus::message::message& m)
+void handleLegacyIpmiCommand(sdbusplus::message_t& m)
 {
     // make a copy so the next two moves don't wreak havoc on the stack
-    sdbusplus::message::message b{m};
-    boost::asio::spawn(*getIoContext(), [b = std::move(b)](
-                                            boost::asio::yield_context yield) {
-        sdbusplus::message::message m{std::move(b)};
-        unsigned char seq, netFn, lun, cmd;
-        std::vector<uint8_t> data;
+    sdbusplus::message_t b{m};
+    boost::asio::spawn(
+        *getIoContext(),
+        [b = std::move(b)](boost::asio::yield_context yield) {
+            sdbusplus::message_t m{std::move(b)};
+            unsigned char seq = 0, netFn = 0, lun = 0, cmd = 0;
+            ipmi::SecureBuffer data;
 
-        m.read(seq, netFn, lun, cmd, data);
-        auto ctx = std::make_shared<ipmi::Context>(
-            netFn, cmd, 0, 0, ipmi::Privilege::Admin, 0, &yield);
-        auto request = std::make_shared<ipmi::message::Request>(
-            ctx, std::forward<std::vector<uint8_t>>(data));
-        ipmi::message::Response::ptr response =
-            ipmi::executeIpmiCommand(request);
+            m.read(seq, netFn, lun, cmd, data);
+            std::shared_ptr<sdbusplus::asio::connection> bus = getSdBus();
+            auto ctx = std::make_shared<ipmi::Context>(
+                bus, netFn, lun, cmd, 0, 0, 0, ipmi::Privilege::Admin, 0, 0,
+                yield);
+            auto request = std::make_shared<ipmi::message::Request>(
+                ctx, std::forward<ipmi::SecureBuffer>(data));
+            ipmi::message::Response::ptr response =
+                ipmi::executeIpmiCommand(request);
 
-        // Responses in IPMI require a bit set.  So there ya go...
-        netFn |= 0x01;
+            // Responses in IPMI require a bit set.  So there ya go...
+            netFn |= 0x01;
 
-        const char *dest, *path;
-        constexpr const char* DBUS_INTF = "org.openbmc.HostIpmi";
+            const char *dest, *path;
+            constexpr const char* DBUS_INTF = "org.openbmc.HostIpmi";
 
-        dest = m.get_sender();
-        path = m.get_path();
-        boost::system::error_code ec;
-        getSdBus()->yield_method_call(yield, ec, dest, path, DBUS_INTF,
-                                      "sendMessage", seq, netFn, lun, cmd,
-                                      response->cc, response->payload.raw);
-        if (ec)
-        {
-            log<level::ERR>("Failed to send response to requestor",
-                            entry("ERROR=%s", ec.message().c_str()),
-                            entry("SENDER=%s", dest),
-                            entry("NETFN=0x%X", netFn), entry("CMD=0x%X", cmd));
-        }
-    });
+            dest = m.get_sender();
+            path = m.get_path();
+            boost::system::error_code ec;
+            bus->yield_method_call(yield, ec, dest, path, DBUS_INTF,
+                                   "sendMessage", seq, netFn, lun, cmd,
+                                   response->cc, response->payload.raw);
+            if (ec)
+            {
+                lg2::error(
+                    "Failed to send response to requestor ({NETFN}/{CMD}): {ERROR}",
+                    "ERROR", ec.message(), "SENDER", dest, "NETFN", lg2::hex,
+                    netFn, "CMD", lg2::hex, cmd);
+            }
+        },
+        {});
 }
 
 #endif /* ALLOW_DEPRECATED_API */
@@ -784,7 +805,7 @@ using CommandHandler = phosphor::host::command::CommandHandler;
 std::unique_ptr<phosphor::host::command::Manager> cmdManager;
 void ipmid_send_cmd_to_host(CommandHandler&& cmd)
 {
-    return cmdManager->execute(std::forward<CommandHandler>(cmd));
+    cmdManager->execute(std::forward<CommandHandler>(cmd));
 }
 
 std::unique_ptr<phosphor::host::command::Manager>& ipmid_get_host_cmd_manager()
@@ -812,16 +833,6 @@ int main(int argc, char* argv[])
     }
     auto sdbusp = std::make_shared<sdbusplus::asio::connection>(*io, bus);
     setSdBus(sdbusp);
-    sdbusp->request_name("xyz.openbmc_project.Ipmi.Host");
-
-    // TODO: Hack to keep the sdEvents running.... Not sure why the sd_event
-    //       queue stops running if we don't have a timer that keeps re-arming
-    phosphor::Timer t2([]() { ; });
-    t2.start(std::chrono::microseconds(500000), true);
-
-    // TODO: Remove all vestiges of sd_event from phosphor-host-ipmid
-    //       until that is done, add the sd_event wrapper to the io object
-    sdbusplus::asio::sd_event_wrapper sdEvents(*io);
 
     cmdManager = std::make_unique<phosphor::host::command::Manager>(*sdbusp);
 
@@ -829,23 +840,16 @@ int main(int argc, char* argv[])
     std::forward_list<ipmi::IpmiProvider> providers =
         ipmi::loadProviders(HOST_IPMI_LIB_PATH);
 
-    // Add bindings for inbound IPMI requests
-    auto server = sdbusplus::asio::object_server(sdbusp);
-    auto iface = server.add_interface("/xyz/openbmc_project/Ipmi",
-                                      "xyz.openbmc_project.Ipmi.Server");
-    iface->register_method("execute", ipmi::executionEntry);
-    iface->initialize();
-
 #ifdef ALLOW_DEPRECATED_API
     // listen on deprecated signal interface for kcs/bt commands
     constexpr const char* FILTER = "type='signal',interface='org.openbmc."
                                    "HostIpmi',member='ReceivedMessage'";
-    sdbusplus::bus::match::match oldIpmiInterface(*sdbusp, FILTER,
-                                                  handleLegacyIpmiCommand);
+    sdbusplus::bus::match_t oldIpmiInterface(*sdbusp, FILTER,
+                                             handleLegacyIpmiCommand);
 #endif /* ALLOW_DEPRECATED_API */
 
     // set up bus name watching to match channels with bus names
-    sdbusplus::bus::match::match nameOwnerChanged(
+    sdbusplus::bus::match_t nameOwnerChanged(
         *sdbusp,
         sdbusplus::bus::match::rules::nameOwnerChanged() +
             sdbusplus::bus::match::rules::arg0namespace(
@@ -853,16 +857,25 @@ int main(int argc, char* argv[])
         ipmi::nameChangeHandler);
     ipmi::doListNames(*io, *sdbusp);
 
+    int exitCode = 0;
     // set up boost::asio signal handling
-    std::function<SignalResponse(int)> stopAsioRunLoop =
-        [&io](int signalNumber) {
-            log<level::INFO>("Received signal; quitting",
-                             entry("SIGNAL=%d", signalNumber));
-            io->stop();
-            return SignalResponse::breakExecution;
-        };
+    std::function<SignalResponse(int)> stopAsioRunLoop = [&io, &exitCode](
+                                                             int signalNumber) {
+        lg2::info("Received signal {SIGNAL}; quitting", "SIGNAL", signalNumber);
+        io->stop();
+        exitCode = signalNumber;
+        return SignalResponse::breakExecution;
+    };
     registerSignalHandler(ipmi::prioOpenBmcBase, SIGINT, stopAsioRunLoop);
     registerSignalHandler(ipmi::prioOpenBmcBase, SIGTERM, stopAsioRunLoop);
+
+    sdbusp->request_name("xyz.openbmc_project.Ipmi.Host");
+    // Add bindings for inbound IPMI requests
+    auto server = sdbusplus::asio::object_server(sdbusp);
+    auto iface = server.add_interface("/xyz/openbmc_project/Ipmi",
+                                      "xyz.openbmc_project.Ipmi.Server");
+    iface->register_method("execute", ipmi::executionEntry);
+    iface->initialize();
 
     io->run();
 
@@ -874,5 +887,5 @@ int main(int argc, char* argv[])
     // unload the provider libraries
     providers.clear();
 
-    return 0;
+    std::exit(exitCode);
 }

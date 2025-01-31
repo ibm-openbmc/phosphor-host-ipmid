@@ -22,6 +22,7 @@
 #include <ipmid/api.h>
 #endif
 
+#include <boost/asio/io_context.hpp>
 #include <ipmid/api-types.hpp>
 #include <ipmid/filter.hpp>
 #include <ipmid/handler.hpp>
@@ -47,7 +48,7 @@ std::shared_ptr<sdbusplus::asio::connection> getSdBus();
 template <typename WorkFn>
 static inline void post_work(WorkFn work)
 {
-    getIoContext()->post(std::forward<WorkFn>(work));
+    boost::asio::post(*getIoContext(), std::forward<WorkFn>(work));
 }
 
 enum class SignalResponse : int

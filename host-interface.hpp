@@ -2,6 +2,7 @@
 
 #include <host-cmd-manager.hpp>
 #include <sdbusplus/bus.hpp>
+#include <xyz/openbmc_project/Condition/HostFirmware/server.hpp>
 #include <xyz/openbmc_project/Control/Host/server.hpp>
 namespace phosphor
 {
@@ -11,23 +12,26 @@ namespace command
 {
 
 /** @class Host
- *  @brief OpenBMC control host interface implementation.
+ *  @brief OpenBMC control and condition host interface implementation.
  *  @details A concrete implementation for xyz.openbmc_project.Control.Host
- *  DBus API.
+ *  and xyz.openbmc_project.Condition.HostFirmware DBus API's.
  */
-class Host : public sdbusplus::server::object::object<
-                 sdbusplus::xyz::openbmc_project::Control::server::Host>
+class Host :
+    public sdbusplus::server::object_t<
+        sdbusplus::server::xyz::openbmc_project::control::Host,
+        sdbusplus::server::xyz::openbmc_project::condition::HostFirmware>
 {
   public:
-    /** @brief Constructs Host Control Interface
+    /** @brief Constructs Host Control and Condition Interfaces
      *
      *  @param[in] bus     - The Dbus bus object
      *  @param[in] objPath - The Dbus object path
      */
-    Host(sdbusplus::bus::bus& bus, const char* objPath) :
-        sdbusplus::server::object::object<
-            sdbusplus::xyz::openbmc_project::Control::server::Host>(bus,
-                                                                    objPath),
+    Host(sdbusplus::bus_t& bus, const char* objPath) :
+        sdbusplus::server::object_t<
+            sdbusplus::server::xyz::openbmc_project::control::Host,
+            sdbusplus::server::xyz::openbmc_project::condition::HostFirmware>(
+            bus, objPath),
         bus(bus)
     {
         // Nothing to do
@@ -41,9 +45,12 @@ class Host : public sdbusplus::server::object::object<
      */
     void execute(Command command) override;
 
+    /** @brief Override reads to CurrentFirmwareCondition */
+    FirmwareCondition currentFirmwareCondition() const override;
+
   private:
     /** @brief sdbusplus DBus bus connection. */
-    sdbusplus::bus::bus& bus;
+    sdbusplus::bus_t& bus;
 
     /** @brief  Callback function to be invoked by command manager
      *

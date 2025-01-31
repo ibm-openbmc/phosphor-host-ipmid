@@ -19,13 +19,14 @@
 
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/elog.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <sdeventplus/event.hpp>
 #include <sdeventplus/exception.hpp>
 #include <xyz/openbmc_project/State/Host/error.hpp>
 
 // Return -1 on any errors to ensure we follow the calling targets OnFailure=
 // path
-int main(int argc, char** argv)
+int main(int, char**)
 {
     using namespace phosphor::logging;
 
@@ -33,7 +34,7 @@ int main(int argc, char** argv)
     auto bus = sdbusplus::bus::new_default();
 
     // Add systemd object manager.
-    sdbusplus::server::manager::manager(bus, SOFTOFF_OBJPATH);
+    sdbusplus::server::manager_t(bus, SOFTOFF_OBJPATH);
 
     // Get default event loop
     auto event = sdeventplus::Event::get_default();
@@ -59,8 +60,7 @@ int main(int argc, char** argv)
         }
         catch (const sdeventplus::SdEventError& e)
         {
-            log<level::ERR>("Failure in processing request",
-                            entry("ERROR=%s", e.what()));
+            lg2::error("Failure in processing request: {ERROR}", "ERROR", e);
             return 1;
         }
     }
@@ -72,8 +72,8 @@ int main(int argc, char** argv)
          phosphor::ipmi::Base::SoftPowerOff::HostResponse::SoftOffReceived))
     {
         using error =
-            sdbusplus::xyz::openbmc_project::State::Host::Error::SoftOffTimeout;
-        using errorMetadata = xyz::openbmc_project::State::Host::SoftOffTimeout;
+            sdbusplus::error::xyz::openbmc_project::state::host::SoftOffTimeout;
+        using errorMetadata = xyz::openbmc_project::state::host::SoftOffTimeout;
         report<error>(prev_entry<errorMetadata::TIMEOUT_IN_MSEC>());
         return -1;
     }

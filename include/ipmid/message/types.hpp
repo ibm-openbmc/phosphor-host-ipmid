@@ -15,19 +15,27 @@
  */
 #pragma once
 
-#include <bitset>
 #include <boost/multiprecision/cpp_int.hpp>
+#include <boost/version.hpp>
 #include <ipmid/utility.hpp>
+
+#include <bitset>
 #include <tuple>
 
+#if BOOST_VERSION < 107900
+using bitcount_t = unsigned;
+#else
+using bitcount_t = std::size_t;
+#endif
+
 // unsigned fixed-bit sizes
-template <unsigned N>
+template <bitcount_t N>
 using fixed_uint_t =
     boost::multiprecision::number<boost::multiprecision::cpp_int_backend<
         N, N, boost::multiprecision::unsigned_magnitude,
         boost::multiprecision::unchecked, void>>;
 // signed fixed-bit sizes
-template <unsigned N>
+template <bitcount_t N>
 using fixed_int_t =
     boost::multiprecision::number<boost::multiprecision::cpp_int_backend<
         N, N, boost::multiprecision::signed_magnitude,
@@ -79,18 +87,23 @@ namespace types
 namespace details
 {
 
-template <size_t N>
+template <bitcount_t N>
 struct Size
 {
-    static constexpr size_t value = N;
+    static constexpr bitcount_t value = N;
 };
 
-template <unsigned Bits>
+template <bitcount_t Bits>
 constexpr auto getNrBits(const fixed_int_t<Bits>&) -> Size<Bits>;
-template <unsigned Bits>
+template <bitcount_t Bits>
 constexpr auto getNrBits(const fixed_uint_t<Bits>&) -> Size<Bits>;
-template <size_t Bits>
+template <bitcount_t Bits>
 constexpr auto getNrBits(const std::bitset<Bits>&) -> Size<Bits>;
+
+template <typename U>
+using underlying_t =
+    typename std::conditional_t<std::is_enum_v<U>, std::underlying_type<U>,
+                                std::enable_if<true, U>>::type;
 
 } // namespace details
 
@@ -106,5 +119,20 @@ constexpr auto getNrBits(const std::bitset<Bits>&) -> Size<Bits>;
 template <typename T>
 constexpr auto nrFixedBits =
     decltype(details::getNrBits(std::declval<T>()))::value;
+
+/**
+ * @brief Converts a number or enum class to another
+ * @tparam R - The output type
+ * @tparam T - The input type
+ * @param t - An enum or integer value to cast
+ * @return The value in R form
+ */
+template <typename R, typename T>
+inline R enum_cast(T t)
+{
+    auto tu = static_cast<details::underlying_t<T>>(t);
+    auto ru = static_cast<details::underlying_t<R>>(tu);
+    return static_cast<R>(ru);
+}
 
 } // namespace types

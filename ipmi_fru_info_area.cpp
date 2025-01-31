@@ -1,10 +1,14 @@
 #include "ipmi_fru_info_area.hpp"
 
+#include <phosphor-logging/elog.hpp>
+#include <phosphor-logging/lg2.hpp>
+
 #include <algorithm>
 #include <ctime>
+#include <iomanip>
 #include <map>
 #include <numeric>
-#include <phosphor-logging/elog.hpp>
+#include <sstream>
 
 namespace ipmi
 {
@@ -13,12 +17,12 @@ namespace fru
 using namespace phosphor::logging;
 
 // Property variables
-static constexpr auto partNumber = "PartNumber";
-static constexpr auto serialNumber = "SerialNumber";
+static constexpr auto partNumber = "Part Number";
+static constexpr auto serialNumber = "Serial Number";
 static constexpr auto manufacturer = "Manufacturer";
-static constexpr auto buildDate = "BuildDate";
-static constexpr auto model = "Model";
-static constexpr auto prettyName = "PrettyName";
+static constexpr auto buildDate = "Mfg Date";
+static constexpr auto modelNumber = "Model Number";
+static constexpr auto prettyName = "Name";
 static constexpr auto version = "Version";
 static constexpr auto type = "Type";
 
@@ -35,10 +39,9 @@ static constexpr auto englishLanguageCode = 0x0;
 static constexpr auto typeLengthByteNull = 0x0;
 static constexpr auto endOfCustomFields = 0xC1;
 static constexpr auto commonHeaderFormatSize = 0x8; // size in bytes
-static constexpr auto manufacturingDateSize = 0x3;
 static constexpr auto areaSizeOffset = 0x1;
 static constexpr uint8_t typeASCII = 0xC0;
-static constexpr auto maxRecordAttributeValue = 0x1F;
+static constexpr auto maxRecordAttributeValue = 0x3F;
 
 static constexpr auto secs_from_1970_1996 = 820454400;
 static constexpr auto maxMfgDateValue = 0xFFFFFF; // 3 Byte length
@@ -139,11 +142,11 @@ void appendChassisType(const PropertyMap& propMap, FruAreaData& data)
         {
             chassisType = std::stoi(value);
         }
-        catch (std::exception& e)
+        catch (const std::exception& e)
         {
-            log<level::ERR>("Could not parse chassis type",
-                            entry("VALUE=%s", value.c_str()),
-                            entry("ERROR=%s", e.what()));
+            lg2::error("Could not parse chassis type, value: {VALUE}, "
+                       "error: {ERROR}",
+                       "VALUE", value, "ERROR", e);
             chassisType = 0;
         }
     }
@@ -172,8 +175,8 @@ void appendData(const Property& key, const PropertyMap& propMap,
             value.erase(0, 2);
         }
 
-        // 5 bits for length
-        // if length is greater then 31(2^5) bytes then trim the data to 31
+        // 6 bits for length as per FRU spec v1.0
+        // if length is greater then 63(2^6) bytes then trim the data to 63
         // bytess.
         auto valueLength = (value.length() > maxRecordAttributeValue)
                                ? maxRecordAttributeValue
@@ -193,6 +196,29 @@ void appendData(const Property& key, const PropertyMap& propMap,
     }
 }
 
+std::time_t timeStringToRaw(const std::string& input)
+{
+    // TODO: For non-US region timestamps, pass in region information for the
+    // FRU to avoid the month/day swap.
+    // 2017-02-24 - 13:59:00, Tue Nov 20 23:08:00 2018
+    static const std::vector<std::string> patterns = {"%Y-%m-%d - %H:%M:%S",
+                                                      "%a %b %d %H:%M:%S %Y"};
+
+    std::tm time = {};
+
+    for (const auto& pattern : patterns)
+    {
+        std::istringstream timeStream(input);
+        timeStream >> std::get_time(&time, pattern.c_str());
+        if (!timeStream.fail())
+        {
+            break;
+        }
+    }
+
+    return timegm(&time);
+}
+
 /**
  * @brief Appends Build Date
  *
@@ -205,9 +231,7 @@ void appendMfgDate(const PropertyMap& propMap, FruAreaData& data)
     auto iter = propMap.find(buildDate);
     if ((iter != propMap.end()) && (iter->second.size() > 0))
     {
-        tm time = {};
-        strptime(iter->second.c_str(), "%F - %H:%M:%S", &time);
-        time_t raw = mktime(&time);
+        std::time_t raw = timeStringToRaw(iter->second);
 
         // From FRU Spec:
         // "Mfg. Date / Time
@@ -282,7 +306,7 @@ FruAreaData buildChassisInfoArea(const PropertyMap& propMap)
         appendChassisType(propMap, fruAreaData);
 
         // Chasiss part number, in config.yaml it is configured as model
-        appendData(model, propMap, fruAreaData);
+        appendData(modelNumber, propMap, fruAreaData);
 
         // Board serial number
         appendData(serialNumber, propMap, fruAreaData);
@@ -359,7 +383,7 @@ FruAreaData buildProductInfoArea(const PropertyMap& propMap)
         appendData(prettyName, propMap, fruAreaData);
 
         // Product part/model number
-        appendData(model, propMap, fruAreaData);
+        appendData(modelNumber, propMap, fruAreaData);
 
         // Product version
         appendData(version, propMap, fruAreaData);
@@ -402,7 +426,7 @@ FruAreaData buildFruAreaData(const FruInventoryData& inventory)
     auto chassisIt = inventory.find(chassis);
     if (chassisIt != inventory.end())
     {
-        chassisArea = std::move(buildChassisInfoArea(chassisIt->second));
+        chassisArea = buildChassisInfoArea(chassisIt->second);
     }
     // update the offset to chassis data.
     buildCommonHeaderSection(chassisArea.size(), curDataOffset, combFruArea);
@@ -412,7 +436,7 @@ FruAreaData buildFruAreaData(const FruInventoryData& inventory)
     auto boardIt = inventory.find(board);
     if (boardIt != inventory.end())
     {
-        boardArea = std::move(buildBoardInfoArea(boardIt->second));
+        boardArea = buildBoardInfoArea(boardIt->second);
     }
     // update the offset to the board data.
     buildCommonHeaderSection(boardArea.size(), curDataOffset, combFruArea);
@@ -422,7 +446,7 @@ FruAreaData buildFruAreaData(const FruInventoryData& inventory)
     auto prodIt = inventory.find(product);
     if (prodIt != inventory.end())
     {
-        prodArea = std::move(buildProductInfoArea(prodIt->second));
+        prodArea = buildProductInfoArea(prodIt->second);
     }
     // update the offset to the product data.
     buildCommonHeaderSection(prodArea.size(), curDataOffset, combFruArea);

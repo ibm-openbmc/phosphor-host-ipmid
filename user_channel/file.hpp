@@ -2,13 +2,13 @@
 
 #include <stdio.h>
 
-#include <experimental/filesystem>
+#include <filesystem>
 namespace phosphor
 {
 namespace user
 {
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
 
 /** @class File
  *  @brief Responsible for handling file pointer
@@ -42,9 +42,7 @@ class File
      *  @param[in] removeOnExit - File to be removed at exit or no
      */
     File(const std::string& name, const std::string& mode,
-         bool removeOnExit = false) :
-        name(name),
-        removeOnExit(removeOnExit)
+         bool removeOnExit = false) : name(name), removeOnExit(removeOnExit)
     {
         fp = fopen(name.c_str(), mode.c_str());
     }
@@ -57,9 +55,7 @@ class File
      *  @param[in] removeOnExit - File to be removed at exit or no
      */
     File(int fd, const std::string& name, const std::string& mode,
-         bool removeOnExit = false) :
-        name(name),
-        removeOnExit(removeOnExit)
+         bool removeOnExit = false) : name(name), removeOnExit(removeOnExit)
     {
         fp = fdopen(fd, mode.c_str());
     }

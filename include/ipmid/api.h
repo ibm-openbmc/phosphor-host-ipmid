@@ -3,6 +3,8 @@
 
 #include <systemd/sd-bus.h>
 
+#include <cstddef>
+
 /*
  * Specifies the minimum privilege level required to execute the command
  * This means the command can be executed at a given privilege level or higher
@@ -53,7 +55,7 @@ typedef void* ipmi_context_t;
 
 // Length of request / response buffer depending on whether the data is a
 // request or a response from a plugin handler.
-typedef size_t* ipmi_data_len_t;
+typedef std::size_t* ipmi_data_len_t;
 
 // Plugin function return the status code
 typedef unsigned char ipmi_ret_t;
@@ -149,7 +151,6 @@ typedef enum
 EInterfaceIndex getInterfaceIndex(void);
 
 sd_bus* ipmid_get_sd_bus_connection(void);
-sd_event* ipmid_get_sd_event_connection(void);
 sd_bus_slot* ipmid_get_sd_bus_slot(void);
 
 // move this from ipmid.hpp, which is now gone

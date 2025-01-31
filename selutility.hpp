@@ -1,9 +1,13 @@
 #pragma once
 
-#include <chrono>
-#include <cstdint>
 #include <ipmid/types.hpp>
 #include <sdbusplus/server.hpp>
+
+#include <chrono>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 
 namespace ipmi
 {
@@ -15,9 +19,14 @@ static constexpr auto mapperBusName = "xyz.openbmc_project.ObjectMapper";
 static constexpr auto mapperObjPath = "/xyz/openbmc_project/object_mapper";
 static constexpr auto mapperIntf = "xyz.openbmc_project.ObjectMapper";
 
+static constexpr auto logWatchPath = "/xyz/openbmc_project/logging";
 static constexpr auto logBasePath = "/xyz/openbmc_project/logging/entry";
 static constexpr auto logEntryIntf = "xyz.openbmc_project.Logging.Entry";
 static constexpr auto logDeleteIntf = "xyz.openbmc_project.Object.Delete";
+
+static constexpr auto logObj = "/xyz/openbmc_project/logging";
+static constexpr auto logIntf = "xyz.openbmc_project.Collection.DeleteAll";
+static constexpr auto logDeleteAllMethod = "DeleteAll";
 
 static constexpr auto propIntf = "org.freedesktop.DBus.Properties";
 
@@ -27,32 +36,26 @@ using Resolved = bool;
 using Id = uint32_t;
 using Timestamp = uint64_t;
 using Message = std::string;
-using AdditionalData = std::vector<std::string>;
+using AdditionalData = std::map<std::string, std::string>;
 using PropertyType =
     std::variant<Resolved, Id, Timestamp, Message, AdditionalData>;
 
 static constexpr auto selVersion = 0x51;
 static constexpr auto invalidTimeStamp = 0xFFFFFFFF;
-static constexpr auto operationSupport = 0x0A;
-
-/** @struct GetSELInfoResponse
- *
- *  IPMI payload for Get SEL Info command response.
- */
-struct GetSELInfoResponse
-{
-    uint8_t selVersion;       //!< SEL revision.
-    uint16_t entries;         //!< Number of log entries in SEL.
-    uint16_t freeSpace;       //!< Free Space in bytes.
-    uint32_t addTimeStamp;    //!< Most recent addition timestamp.
-    uint32_t eraseTimeStamp;  //!< Most recent erase timestamp.
-    uint8_t operationSupport; //!< Operation support.
-} __attribute__((packed));
 
 static constexpr auto firstEntry = 0x0000;
 static constexpr auto lastEntry = 0xFFFF;
 static constexpr auto entireRecord = 0xFF;
 static constexpr auto selRecordSize = 16;
+
+namespace operationSupport
+{
+static constexpr bool overflow = false;
+static constexpr bool deleteSel = true;
+static constexpr bool partialAddSelEntry = false;
+static constexpr bool reserveSel = true;
+static constexpr bool getSelAllocationInfo = false;
+} // namespace operationSupport
 
 /** @struct GetSELEntryRequest
  *
@@ -66,13 +69,14 @@ struct GetSELEntryRequest
     uint8_t readLength;     //!< Bytes to read.
 } __attribute__((packed));
 
-/** @struct GetSELEntryResponse
+constexpr size_t SELRecordLength = 16;
+
+/** @struct SELEventRecord
  *
- *  IPMI payload for Get SEL Entry command response.
+ * IPMI SEL Event Record
  */
-struct GetSELEntryResponse
+struct SELEventRecord
 {
-    uint16_t nextRecordID;    //!< Next RecordID.
     uint16_t recordID;        //!< Record ID.
     uint8_t recordType;       //!< Record Type.
     uint32_t timeStamp;       //!< Timestamp.
@@ -85,6 +89,56 @@ struct GetSELEntryResponse
     uint8_t eventData2;       //!< Event Data 2.
     uint8_t eventData3;       //!< Event Data 3.
 } __attribute__((packed));
+
+static_assert(sizeof(SELEventRecord) == SELRecordLength);
+
+/** @struct SELOEMRecordTypeCD
+ *
+ * IPMI SEL OEM Record - Type C0h-DFh
+ */
+struct SELOEMRecordTypeCD
+{
+    uint16_t recordID;         //!< Record ID.
+    uint8_t recordType;        //!< Record Type.
+    uint32_t timeStamp;        //!< Timestamp.
+    uint8_t manufacturerID[3]; //!< Manufacturer ID.
+    uint8_t oemDefined[6];     //!< OEM Defined data.
+} __attribute__((packed));
+
+static_assert(sizeof(SELOEMRecordTypeCD) == SELRecordLength);
+
+/** @struct SELOEMRecordTypeEF
+ *
+ * IPMI SEL OEM Record - Type E0h-FFh
+ */
+struct SELOEMRecordTypeEF
+{
+    uint16_t recordID;      //!< Record ID.
+    uint8_t recordType;     //!< Record Type.
+    uint8_t oemDefined[13]; //!< OEM Defined data.
+} __attribute__((packed));
+
+static_assert(sizeof(SELOEMRecordTypeEF) == SELRecordLength);
+
+union SELEventRecordFormat
+{
+    SELEventRecord eventRecord;
+    SELOEMRecordTypeCD oemCD;
+    SELOEMRecordTypeEF oemEF;
+};
+
+/** @struct GetSELEntryResponse
+ *
+ *  IPMI payload for Get SEL Entry command response.
+ */
+struct GetSELEntryResponse
+{
+    uint16_t nextRecordID;      //!< Next RecordID.
+    SELEventRecordFormat event; // !< The Event Record.
+} __attribute__((packed));
+
+static_assert(sizeof(GetSELEntryResponse) ==
+              SELRecordLength + sizeof(uint16_t));
 
 static constexpr auto initiateErase = 0xAA;
 static constexpr auto getEraseStatus = 0x00;
@@ -122,6 +176,17 @@ std::chrono::seconds getEntryTimeStamp(const std::string& objPath);
  */
 void readLoggingObjectPaths(ObjectPaths& paths);
 
+template <typename T>
+std::string toHexStr(const T& data)
+{
+    std::stringstream stream;
+    stream << std::hex << std::uppercase << std::setfill('0');
+    for (const auto& v : data)
+    {
+        stream << std::setw(2) << static_cast<int>(v);
+    }
+    return stream.str();
+}
 namespace internal
 {
 

@@ -15,11 +15,14 @@
  */
 #pragma once
 
-#include <array>
 #include <ipmid/message/types.hpp>
+#include <phosphor-logging/lg2.hpp>
+#include <phosphor-logging/log.hpp>
+
+#include <array>
 #include <memory>
 #include <optional>
-#include <phosphor-logging/log.hpp>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -118,8 +121,7 @@ struct PackSingle<std::string>
         uint8_t len;
         if (t.length() > std::numeric_limits<decltype(len)>::max())
         {
-            using namespace phosphor::logging;
-            log<level::ERR>("long string truncated on IPMI message pack");
+            lg2::error("long string truncated on IPMI message pack");
             return 1;
         }
         len = static_cast<uint8_t>(t.length());
@@ -131,14 +133,16 @@ struct PackSingle<std::string>
 
 /** @brief Specialization of PackSingle for fixed_uint_t types
  */
-template <unsigned N>
+template <bitcount_t N>
 struct PackSingle<fixed_uint_t<N>>
 {
     static int op(Payload& p, const fixed_uint_t<N>& t)
     {
         size_t count = N;
         static_assert(N <= (details::bitStreamSize - CHAR_BIT));
-        uint64_t bits = t;
+        static_assert(N <= std::numeric_limits<uint64_t>::digits,
+                      "Type exceeds uint64_t limit");
+        uint64_t bits = static_cast<uint64_t>(t);
         while (count > 0)
         {
             size_t appendCount = std::min(count, static_cast<size_t>(CHAR_BIT));
@@ -239,6 +243,38 @@ template <>
 struct PackSingle<std::vector<uint8_t>>
 {
     static int op(Payload& p, const std::vector<uint8_t>& t)
+    {
+        if (p.bitCount != 0)
+        {
+            return 1;
+        }
+        p.raw.reserve(p.raw.size() + t.size());
+        p.raw.insert(p.raw.end(), t.begin(), t.end());
+        return 0;
+    }
+};
+
+/** @brief Specialization of PackSingle for SecureBuffer */
+template <>
+struct PackSingle<SecureBuffer>
+{
+    static int op(Payload& p, const SecureBuffer& t)
+    {
+        if (p.bitCount != 0)
+        {
+            return 1;
+        }
+        p.raw.reserve(p.raw.size() + t.size());
+        p.raw.insert(p.raw.end(), t.begin(), t.end());
+        return 0;
+    }
+};
+
+/** @brief Specialization of PackSingle for std::span<const uint8_t> */
+template <>
+struct PackSingle<std::span<const uint8_t>>
+{
+    static int op(Payload& p, const std::span<const uint8_t>& t)
     {
         if (p.bitCount != 0)
         {

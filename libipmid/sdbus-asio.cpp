@@ -1,6 +1,7 @@
-#include <boost/asio.hpp>
-#include <memory>
+#include <boost/asio/io_context.hpp>
 #include <sdbusplus/asio/connection.hpp>
+
+#include <memory>
 
 namespace
 {

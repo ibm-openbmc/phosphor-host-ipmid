@@ -2,14 +2,16 @@
 
 #include "fruread.hpp"
 
-#include <algorithm>
 #include <ipmid/api.hpp>
 #include <ipmid/types.hpp>
 #include <ipmid/utils.hpp>
-#include <map>
 #include <phosphor-logging/elog-errors.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <sdbusplus/message/types.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
+
+#include <algorithm>
+#include <map>
 
 extern const FruMap frus;
 namespace ipmi
@@ -19,13 +21,9 @@ namespace fru
 
 using namespace phosphor::logging;
 using InternalFailure =
-    sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
+    sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
 std::unique_ptr<sdbusplus::bus::match_t> matchPtr
     __attribute__((init_priority(101)));
-
-static constexpr auto INV_INTF = "xyz.openbmc_project.Inventory.Manager";
-static constexpr auto OBJ_PATH = "/xyz/openbmc_project/inventory";
-static constexpr auto PROP_INTF = "org.freedesktop.DBus.Properties";
 
 namespace cache
 {
@@ -48,26 +46,42 @@ ipmi::PropertyMap readAllProperties(const std::string& intf,
                                     const std::string& path)
 {
     ipmi::PropertyMap properties;
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
-    auto service = ipmi::getService(bus, INV_INTF, OBJ_PATH);
-    std::string objPath = OBJ_PATH + path;
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
+    std::string service;
+    std::string objPath;
+
+    // Is the path the full dbus path?
+    if (path.find(xyzPrefix) != std::string::npos)
+    {
+        service = ipmi::getService(bus, intf, path);
+        objPath = path;
+    }
+    else
+    {
+        service = ipmi::getService(bus, invMgrInterface, invObjPath);
+        objPath = invObjPath + path;
+    }
+
     auto method = bus.new_method_call(service.c_str(), objPath.c_str(),
-                                      PROP_INTF, "GetAll");
+                                      propInterface, "GetAll");
     method.append(intf);
-    auto reply = bus.call(method);
-    if (reply.is_method_error())
+    try
+    {
+        auto reply = bus.call(method);
+        reply.read(properties);
+    }
+    catch (const sdbusplus::exception_t& e)
     {
         // If property is not found simply return empty value
-        log<level::ERR>("Error in reading property values from inventory",
-                        entry("INTERFACE=%s", intf.c_str()),
-                        entry("PATH=%s", objPath.c_str()));
-        return properties;
+        lg2::error("Error in reading property values: {ERROR}, path: {PATH}, "
+                   "interface: {INTERFACE}",
+                   "ERROR", e, "PATH", objPath, "INTERFACE", intf);
     }
-    reply.read(properties);
+
     return properties;
 }
 
-void processFruPropChange(sdbusplus::message::message& msg)
+void processFruPropChange(sdbusplus::message_t& msg)
 {
     if (cache::fruMap.empty())
     {
@@ -75,9 +89,9 @@ void processFruPropChange(sdbusplus::message::message& msg)
     }
     std::string path = msg.get_path();
     // trim the object base path, if found at the beginning
-    if (path.compare(0, strlen(OBJ_PATH), OBJ_PATH) == 0)
+    if (path.compare(0, strlen(invObjPath), invObjPath) == 0)
     {
-        path.erase(0, strlen(OBJ_PATH));
+        path.erase(0, strlen(invObjPath));
     }
     for (const auto& [fruId, instanceList] : frus)
     {
@@ -99,11 +113,11 @@ int registerCallbackHandler()
     if (matchPtr == nullptr)
     {
         using namespace sdbusplus::bus::match::rules;
-        sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+        sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
         matchPtr = std::make_unique<sdbusplus::bus::match_t>(
             bus,
-            path_namespace(OBJ_PATH) + type::signal() +
-                member("PropertiesChanged") + interface(PROP_INTF),
+            path_namespace(invObjPath) + type::signal() +
+                member("PropertiesChanged") + interface(propInterface),
             std::bind(processFruPropChange, std::placeholders::_1));
     }
     return 0;
@@ -120,7 +134,7 @@ FruInventoryData readDataFromInventory(const FRUId& fruNum)
     auto iter = frus.find(fruNum);
     if (iter == frus.end())
     {
-        log<level::ERR>("Unsupported FRU ID ", entry("FRUID=%d", fruNum));
+        lg2::error("Unsupported FRU ID: {FRUID}", "FRUID", fruNum);
         elog<InternalFailure>();
     }
 
@@ -138,8 +152,9 @@ FruInventoryData readDataFromInventory(const FRUId& fruNum)
                 if (iter != allProp.end())
                 {
                     data[properties.second.section].emplace(
-                        properties.first, std::move(std::get<std::string>(
-                                              allProp[properties.first])));
+                        properties.second.property,
+                        std::move(
+                            std::get<std::string>(allProp[properties.first])));
                 }
             }
         }

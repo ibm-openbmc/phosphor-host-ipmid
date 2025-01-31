@@ -2,15 +2,14 @@
 
 #include "sensorhandler.hpp"
 
-#include <bitset>
-#include <filesystem>
 #include <ipmid/types.hpp>
 #include <ipmid/utils.hpp>
-#include <optional>
-#include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
 #include <sdbusplus/message/types.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
+
+#include <bitset>
+#include <filesystem>
+#include <optional>
 
 namespace ipmi
 {
@@ -19,64 +18,7 @@ namespace sensor
 
 using namespace phosphor::logging;
 using InternalFailure =
-    sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
-
-static constexpr auto MAPPER_BUSNAME = "xyz.openbmc_project.ObjectMapper";
-static constexpr auto MAPPER_PATH = "/xyz/openbmc_project/object_mapper";
-static constexpr auto MAPPER_INTERFACE = "xyz.openbmc_project.ObjectMapper";
-
-/** @brief get the D-Bus service and service path
- *  @param[in] bus - The Dbus bus object
- *  @param[in] interface - interface to the service
- *  @param[in] path - interested path in the list of objects
- *  @return pair of service path and service
- */
-ServicePath getServiceAndPath(sdbusplus::bus::bus& bus,
-                              const std::string& interface,
-                              const std::string& path)
-{
-    auto depth = 0;
-    auto mapperCall = bus.new_method_call(MAPPER_BUSNAME, MAPPER_PATH,
-                                          MAPPER_INTERFACE, "GetSubTree");
-    mapperCall.append("/");
-    mapperCall.append(depth);
-    mapperCall.append(std::vector<Interface>({interface}));
-
-    auto mapperResponseMsg = bus.call(mapperCall);
-    if (mapperResponseMsg.is_method_error())
-    {
-        log<level::ERR>("Mapper GetSubTree failed",
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", interface.c_str()));
-        elog<InternalFailure>();
-    }
-
-    MapperResponseType mapperResponse;
-    mapperResponseMsg.read(mapperResponse);
-    if (mapperResponse.empty())
-    {
-        log<level::ERR>("Invalid mapper response",
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", interface.c_str()));
-        elog<InternalFailure>();
-    }
-
-    if (path.empty())
-    {
-        // Get the first one if the path is not in list.
-        return std::make_pair(mapperResponse.begin()->first,
-                              mapperResponse.begin()->second.begin()->first);
-    }
-    const auto& iter = mapperResponse.find(path);
-    if (iter == mapperResponse.end())
-    {
-        log<level::ERR>("Couldn't find D-Bus path",
-                        entry("PATH=%s", path.c_str()),
-                        entry("INTERFACE=%s", interface.c_str()));
-        elog<InternalFailure>();
-    }
-    return std::make_pair(iter->first, iter->second.begin()->first);
-}
+    sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
 
 AssertionSet getAssertionSet(const SetSensorReadingReq& cmdData)
 {
@@ -91,18 +33,14 @@ AssertionSet getAssertionSet(const SetSensorReadingReq& cmdData)
 
 ipmi_ret_t updateToDbus(IpmiUpdateData& msg)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     try
     {
         auto serviceResponseMsg = bus.call(msg);
-        if (serviceResponseMsg.is_method_error())
-        {
-            log<level::ERR>("Error in D-Bus call");
-            return IPMI_CC_UNSPECIFIED_ERROR;
-        }
     }
-    catch (InternalFailure& e)
+    catch (const InternalFailure& e)
     {
+        lg2::error("Error in D-Bus call: {ERROR}", "ERROR", e);
         commit<InternalFailure>();
         return IPMI_CC_UNSPECIFIED_ERROR;
     }
@@ -130,9 +68,10 @@ GetSensorResponse mapDbusToAssertion(const Info& sensorInfo,
                                      const InstancePath& path,
                                      const DbusInterface& interface)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     GetSensorResponse response{};
-    auto responseData = reinterpret_cast<GetReadingResponse*>(response.data());
+
+    enableScanning(&response);
 
     auto service = ipmi::getService(bus, interface, path);
 
@@ -149,7 +88,7 @@ GetSensorResponse mapDbusToAssertion(const Info& sensorInfo,
             {
                 if (propValue == value.second.assert)
                 {
-                    setOffset(value.first, responseData);
+                    setOffset(value.first, &response);
                     break;
                 }
             }
@@ -159,17 +98,12 @@ GetSensorResponse mapDbusToAssertion(const Info& sensorInfo,
     return response;
 }
 
-GetSensorResponse assertion(const Info& sensorInfo)
+GetSensorResponse mapDbusToEventdata2(const Info& sensorInfo)
 {
-    return mapDbusToAssertion(sensorInfo, sensorInfo.sensorPath,
-                              sensorInfo.sensorInterface);
-}
-
-GetSensorResponse eventdata2(const Info& sensorInfo)
-{
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     GetSensorResponse response{};
-    auto responseData = reinterpret_cast<GetReadingResponse*>(response.data());
+
+    enableScanning(&response);
 
     auto service = ipmi::getService(bus, sensorInfo.sensorInterface,
                                     sensorInfo.sensorPath);
@@ -188,7 +122,7 @@ GetSensorResponse eventdata2(const Info& sensorInfo)
             {
                 if (propValue == value.second.assert)
                 {
-                    setReading(value.first, responseData);
+                    setReading(value.first, &response);
                     break;
                 }
             }
@@ -197,6 +131,51 @@ GetSensorResponse eventdata2(const Info& sensorInfo)
 
     return response;
 }
+
+#ifndef FEATURE_SENSORS_CACHE
+GetSensorResponse assertion(const Info& sensorInfo)
+{
+    return mapDbusToAssertion(sensorInfo, sensorInfo.sensorPath,
+                              sensorInfo.sensorInterface);
+}
+
+GetSensorResponse eventdata2(const Info& sensorInfo)
+{
+    return mapDbusToEventdata2(sensorInfo);
+}
+#else
+std::optional<GetSensorResponse> assertion(uint8_t id, const Info& sensorInfo,
+                                           const PropertyMap& /*properties*/)
+{
+    // The assertion may contain multiple properties
+    // So we have to get the properties from DBus anyway
+    auto response = mapDbusToAssertion(sensorInfo, sensorInfo.sensorPath,
+                                       sensorInfo.sensorInterface);
+
+    if (!sensorCacheMap[id].has_value())
+    {
+        sensorCacheMap[id] = SensorData{};
+    }
+    sensorCacheMap[id]->response = response;
+    return response;
+}
+
+std::optional<GetSensorResponse> eventdata2(uint8_t id, const Info& sensorInfo,
+                                            const PropertyMap& /*properties*/)
+{
+    // The eventdata2 may contain multiple properties
+    // So we have to get the properties from DBus anyway
+    auto response = mapDbusToEventdata2(sensorInfo);
+
+    if (!sensorCacheMap[id].has_value())
+    {
+        sensorCacheMap[id] = SensorData{};
+    }
+    sensorCacheMap[id]->response = response;
+    return response;
+}
+
+#endif // FEATURE_SENSORS_CACHE
 
 } // namespace get
 
@@ -208,7 +187,7 @@ IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
                            const std::string& command,
                            const std::string& sensorInterface)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     using namespace std::string_literals;
 
     auto dbusService = getService(bus, sensorInterface, sensorPath);
@@ -217,7 +196,7 @@ IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
                                updateInterface.c_str(), command.c_str());
 }
 
-ipmi_ret_t eventdata(const SetSensorReadingReq& cmdData, const Info& sensorInfo,
+ipmi_ret_t eventdata(const SetSensorReadingReq&, const Info& sensorInfo,
                      uint8_t data)
 {
     auto msg =
@@ -232,7 +211,7 @@ ipmi_ret_t eventdata(const SetSensorReadingReq& cmdData, const Info& sensorInfo,
         const auto& iter = std::get<OffsetValueMap>(property.second).find(data);
         if (iter == std::get<OffsetValueMap>(property.second).end())
         {
-            log<level::ERR>("Invalid event data");
+            lg2::error("Invalid event data");
             return IPMI_CC_PARM_OUT_OF_RANGE;
         }
         msg.append(iter->second.assert);
@@ -297,11 +276,10 @@ namespace notify
 {
 
 IpmiUpdateData makeDbusMsg(const std::string& updateInterface,
-                           const std::string& sensorPath,
-                           const std::string& command,
-                           const std::string& sensorInterface)
+                           const std::string&, const std::string& command,
+                           const std::string&)
 {
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
     using namespace std::string_literals;
 
     static const auto dbusPath = "/xyz/openbmc_project/inventory"s;
@@ -394,6 +372,8 @@ namespace inventory
 namespace get
 {
 
+#ifndef FEATURE_SENSORS_CACHE
+
 GetSensorResponse assertion(const Info& sensorInfo)
 {
     namespace fs = std::filesystem;
@@ -405,6 +385,32 @@ GetSensorResponse assertion(const Info& sensorInfo)
         sensorInfo, path.string(),
         sensorInfo.propertyInterfaces.begin()->first);
 }
+
+#else
+
+std::optional<GetSensorResponse> assertion(uint8_t id, const Info& sensorInfo,
+                                           const PropertyMap& /*properties*/)
+{
+    // The assertion may contain multiple properties
+    // So we have to get the properties from DBus anyway
+    namespace fs = std::filesystem;
+
+    fs::path path{ipmi::sensor::inventoryRoot};
+    path += sensorInfo.sensorPath;
+
+    auto response = ipmi::sensor::get::mapDbusToAssertion(
+        sensorInfo, path.string(),
+        sensorInfo.propertyInterfaces.begin()->first);
+
+    if (!sensorCacheMap[id].has_value())
+    {
+        sensorCacheMap[id] = SensorData{};
+    }
+    sensorCacheMap[id]->response = response;
+    return response;
+}
+
+#endif
 
 } // namespace get
 

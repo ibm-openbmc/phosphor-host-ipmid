@@ -14,8 +14,6 @@ enum ipmi_netfn_chassis_cmds
     IPMI_CMD_CHASSIS_CONTROL = 0x02,
     IPMI_CMD_CHASSIS_IDENTIFY = 0x04,
     IPMI_CMD_SET_CHASSIS_CAP = 0x05,
-    // Set Power Restore Policy
-    IPMI_CMD_SET_RESTORE_POLICY = 0x06,
     // Get capability bits
     IPMI_CMD_SET_SYS_BOOT_OPTIONS = 0x08,
     IPMI_CMD_GET_SYS_BOOT_OPTIONS = 0x09,
@@ -27,6 +25,7 @@ enum ipmi_chassis_return_codes
 {
     IPMI_OK = 0x0,
     IPMI_CC_PARM_NOT_SUPPORTED = 0x80,
+    IPMI_CC_FAIL_SET_IN_PROGRESS = 0x81,
 };
 
 // Generic completion codes,
@@ -48,13 +47,24 @@ enum ipmi_chassis_control_cmds : uint8_t
 };
 enum class BootOptionParameter : size_t
 {
-    BOOT_INFO = 0x4,
-    BOOT_FLAGS = 0x5,
-    OPAL_NETWORK_SETTINGS = 0x61
+    setInProgress = 0x0,
+    bootFlagValidClr = 0x3,
+    bootInfo = 0x4,
+    bootFlags = 0x5,
+    opalNetworkSettings = 0x61
 };
 
 enum class BootOptionResponseSize : size_t
 {
-    BOOT_FLAGS = 5,
-    OPAL_NETWORK_SETTINGS = 50
+    setInProgress = 3,
+    bootFlags = 5,
+    opalNetworkSettings = 50
+};
+
+enum class ChassisIDState : uint8_t
+{
+    off = 0x0,
+    temporaryOn = 0x1,
+    indefiniteOn = 0x2,
+    reserved = 0x3
 };

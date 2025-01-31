@@ -5,6 +5,8 @@
 #include <ipmid/api.hpp>
 #include <ipmid/types.hpp>
 
+#include <exception>
+
 // IPMI commands for net functions.
 enum ipmi_netfn_sen_cmds
 {
@@ -38,6 +40,16 @@ enum ipmi_sensor_types
     IPMI_SENSOR_TPM = 0xCC,
 };
 
+/** @brief Custom exception for reading sensors that are not funcitonal.
+ */
+struct SensorFunctionalError : public std::exception
+{
+    const char* what() const noexcept
+    {
+        return "Sensor not functional";
+    }
+};
+
 #define MAX_DBUS_PATH 128
 struct dbus_interface_t
 {
@@ -58,10 +70,10 @@ struct PlatformEventRequest
     uint8_t data[3];
 };
 
-static constexpr char const* ipmiSELPath = "/xyz/openbmc_project/Logging/IPMI";
-static constexpr char const* ipmiSELAddInterface =
+static constexpr const char* ipmiSELPath = "/xyz/openbmc_project/Logging/IPMI";
+static constexpr const char* ipmiSELAddInterface =
     "xyz.openbmc_project.Logging.IPMI";
-static const std::string ipmiSELAddMessage = "SEL Entry";
+static const std::string ipmiSELAddMessage = "IPMI generated SEL Entry";
 
 static constexpr int selSystemEventSizeWith3Bytes = 8;
 static constexpr int selSystemEventSizeWith2Bytes = 7;
@@ -79,11 +91,7 @@ ipmi_ret_t ipmi_sen_get_sdr(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                             ipmi_request_t request, ipmi_response_t response,
                             ipmi_data_len_t data_len, ipmi_context_t context);
 
-ipmi_ret_t ipmi_sen_reserve_sdr(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                ipmi_request_t request,
-                                ipmi_response_t response,
-                                ipmi_data_len_t data_len,
-                                ipmi_context_t context);
+ipmi::RspType<uint16_t> ipmiSensorReserveSdr();
 
 static const uint16_t FRU_RECORD_ID_START = 256;
 static const uint16_t ENTITY_RECORD_ID_START = 512;
@@ -103,37 +111,9 @@ namespace request
 // raw value for this call.
 inline bool get_count(void* req)
 {
-    return (bool)((uint64_t)(req)&1);
+    return (bool)((uint64_t)(req) & 1);
 }
 } // namespace request
-
-namespace response
-{
-#define SDR_INFO_RESP_SIZE 2
-inline void set_lun_present(int lun, uint8_t* resp)
-{
-    *resp |= 1 << lun;
-}
-inline void set_lun_not_present(int lun, uint8_t* resp)
-{
-    *resp &= ~(1 << lun);
-}
-inline void set_dynamic_population(uint8_t* resp)
-{
-    *resp |= 1 << 7;
-}
-inline void set_static_population(uint8_t* resp)
-{
-    *resp &= ~(1 << 7);
-}
-} // namespace response
-
-struct GetSdrInfoResp
-{
-    uint8_t count;
-    uint8_t luns_and_dynamic_population;
-};
-
 } // namespace get_sdr_info
 
 /**
@@ -155,7 +135,7 @@ struct GetSdrReq
 namespace request
 {
 
-inline uint8_t get_reservation_id(GetSdrReq* req)
+inline uint16_t get_reservation_id(GetSdrReq* req)
 {
     return (req->reservation_id_lsb + (req->reservation_id_msb << 8));
 };
@@ -210,8 +190,11 @@ inline void set_record_id(int id, SensorDataRecordHeader* hdr)
 enum SensorDataRecordType
 {
     SENSOR_DATA_FULL_RECORD = 0x1,
-    SENSOR_DATA_FRU_RECORD = 0x11,
+    SENSOR_DATA_COMPACT_RECORD = 0x2,
+    SENSOR_DATA_EVENT_RECORD = 0x3,
     SENSOR_DATA_ENTITY_RECORD = 0x8,
+    SENSOR_DATA_FRU_RECORD = 0x11,
+    SENSOR_DATA_MGMT_CTRL_LOCATOR = 0x12,
 };
 
 // Record key
@@ -355,6 +338,51 @@ struct SensorDataFullRecordBody
     uint8_t positive_threshold_hysteresis;
     uint8_t negative_threshold_hysteresis;
     uint16_t reserved;
+    uint8_t oem_reserved;
+    uint8_t id_string_info;
+    char id_string[FULL_RECORD_ID_STR_MAX_LENGTH];
+} __attribute__((packed));
+
+/** @struct SensorDataCompactRecord
+ *
+ *  Compact Sensor Record(body) - SDR Type 2
+ */
+struct SensorDataCompactRecordBody
+{
+    uint8_t entity_id;
+    uint8_t entity_instance;
+    uint8_t sensor_initialization;
+    uint8_t sensor_capabilities; // no macro support
+    uint8_t sensor_type;
+    uint8_t event_reading_type;
+    uint8_t supported_assertions[2];          // no macro support
+    uint8_t supported_deassertions[2];        // no macro support
+    uint8_t discrete_reading_setting_mask[2]; // no macro support
+    uint8_t sensor_units_1;
+    uint8_t sensor_units_2_base;
+    uint8_t sensor_units_3_modifier;
+    uint8_t record_sharing[2];
+    uint8_t positive_threshold_hysteresis;
+    uint8_t negative_threshold_hysteresis;
+    uint8_t reserved[3];
+    uint8_t oem_reserved;
+    uint8_t id_string_info;
+    char id_string[FULL_RECORD_ID_STR_MAX_LENGTH];
+} __attribute__((packed));
+
+/** @struct SensorDataEventRecord
+ *
+ *  Event Only Sensor Record(body) - SDR Type 3
+ */
+struct SensorDataEventRecordBody
+{
+    uint8_t entity_id;
+    uint8_t entity_instance;
+    uint8_t sensor_type;
+    uint8_t event_reading_type;
+    uint8_t sensor_record_sharing_1;
+    uint8_t sensor_record_sharing_2;
+    uint8_t reserved;
     uint8_t oem_reserved;
     uint8_t id_string_info;
     char id_string[FULL_RECORD_ID_STR_MAX_LENGTH];
@@ -576,11 +604,21 @@ inline void set_id_strlen(uint8_t len, SensorDataFullRecordBody* body)
     body->id_string_info &= ~(0x1f);
     body->id_string_info |= len & 0x1f;
 };
+inline void set_id_strlen(uint8_t len, SensorDataEventRecordBody* body)
+{
+    body->id_string_info &= ~(0x1f);
+    body->id_string_info |= len & 0x1f;
+};
 inline uint8_t get_id_strlen(SensorDataFullRecordBody* body)
 {
     return body->id_string_info & 0x1f;
 };
 inline void set_id_type(uint8_t type, SensorDataFullRecordBody* body)
+{
+    body->id_string_info &= ~(3 << 6);
+    body->id_string_info |= (type & 0x3) << 6;
+};
+inline void set_id_type(uint8_t type, SensorDataEventRecordBody* body)
 {
     body->id_string_info &= ~(3 << 6);
     body->id_string_info |= (type & 0x3) << 6;
@@ -626,6 +664,28 @@ struct SensorDataFullRecord
     SensorDataFullRecordBody body;
 } __attribute__((packed));
 
+/** @struct SensorDataComapactRecord
+ *
+ *  Compact Sensor Record - SDR Type 2
+ */
+struct SensorDataCompactRecord
+{
+    SensorDataRecordHeader header;
+    SensorDataRecordKey key;
+    SensorDataCompactRecordBody body;
+} __attribute__((packed));
+
+/** @struct SensorDataEventRecord
+ *
+ *  Event Only Sensor Record - SDR Type 3
+ */
+struct SensorDataEventRecord
+{
+    SensorDataRecordHeader header;
+    SensorDataRecordKey key;
+    SensorDataEventRecordBody body;
+} __attribute__((packed));
+
 /** @struct SensorDataFruRecord
  *
  *  FRU Device Locator Record - SDR Type 11
@@ -665,15 +725,15 @@ namespace sensor
  * @param[in] offset - offset number.
  * @param[in/out] resp - get sensor reading response.
  */
-inline void setOffset(uint8_t offset, ipmi::sensor::GetReadingResponse* resp)
+inline void setOffset(uint8_t offset, ipmi::sensor::GetSensorResponse* resp)
 {
     if (offset > 7)
     {
-        resp->assertOffset8_14 |= 1 << (offset - 8);
+        resp->discreteReadingSensorStates |= 1 << (offset - 8);
     }
     else
     {
-        resp->assertOffset0_7 |= 1 << offset;
+        resp->thresholdLevelsStates |= 1 << offset;
     }
 }
 
@@ -683,7 +743,7 @@ inline void setOffset(uint8_t offset, ipmi::sensor::GetReadingResponse* resp)
  * @param[in] offset - offset number.
  * @param[in/out] resp - get sensor reading response.
  */
-inline void setReading(uint8_t value, ipmi::sensor::GetReadingResponse* resp)
+inline void setReading(uint8_t value, ipmi::sensor::GetSensorResponse* resp)
 {
     resp->reading = value;
 }
@@ -696,10 +756,10 @@ inline void setReading(uint8_t value, ipmi::sensor::GetReadingResponse* resp)
  * @param[in/out] resp - get sensor reading response.
  */
 inline void setAssertionBytes(uint16_t value,
-                              ipmi::sensor::GetReadingResponse* resp)
+                              ipmi::sensor::GetSensorResponse* resp)
 {
-    resp->assertOffset0_7 = static_cast<uint8_t>(value & 0x00FF);
-    resp->assertOffset8_14 = static_cast<uint8_t>(value >> 8);
+    resp->thresholdLevelsStates = static_cast<uint8_t>(value & 0x00FF);
+    resp->discreteReadingSensorStates = static_cast<uint8_t>(value >> 8);
 }
 
 /**
@@ -707,9 +767,11 @@ inline void setAssertionBytes(uint16_t value,
  *
  * @param[in/out] resp - get sensor reading response.
  */
-inline void enableScanning(ipmi::sensor::GetReadingResponse* resp)
+inline void enableScanning(ipmi::sensor::GetSensorResponse* resp)
 {
-    resp->operation = 1 << 6;
+    resp->readingOrStateUnavailable = false;
+    resp->scanningEnabled = true;
+    resp->allEventMessagesEnabled = false;
 }
 
 } // namespace sensor

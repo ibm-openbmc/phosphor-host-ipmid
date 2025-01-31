@@ -1,36 +1,46 @@
+#include "config.h"
+
 #include "sensorhandler.hpp"
 
 #include "fruread.hpp"
 
-#include <mapper.h>
 #include <systemd/sd-bus.h>
+
+#include <ipmid/api.hpp>
+#include <ipmid/entity_map_json.hpp>
+#include <ipmid/types.hpp>
+#include <ipmid/utils.hpp>
+#include <phosphor-logging/elog-errors.hpp>
+#include <phosphor-logging/lg2.hpp>
+#include <sdbusplus/message/types.hpp>
+#include <xyz/openbmc_project/Common/error.hpp>
+#include <xyz/openbmc_project/Sensor/Value/server.hpp>
 
 #include <bitset>
 #include <cmath>
 #include <cstring>
-#include <ipmid/api.hpp>
-#include <ipmid/types.hpp>
-#include <ipmid/utils.hpp>
-#include <phosphor-logging/elog-errors.hpp>
-#include <phosphor-logging/log.hpp>
-#include <sdbusplus/message/types.hpp>
 #include <set>
-#include <xyz/openbmc_project/Common/error.hpp>
-#include <xyz/openbmc_project/Sensor/Value/server.hpp>
 
 static constexpr uint8_t fruInventoryDevice = 0x10;
 static constexpr uint8_t IPMIFruInventory = 0x02;
-static constexpr uint8_t BMCSlaveAddress = 0x20;
+static constexpr uint8_t BMCTargetAddress = 0x20;
 
 extern int updateSensorRecordFromSSRAESC(const void*);
 extern sd_bus* bus;
-extern const ipmi::sensor::IdInfoMap sensors;
+
+namespace ipmi
+{
+namespace sensor
+{
+extern const IdInfoMap sensors;
+} // namespace sensor
+} // namespace ipmi
+
 extern const FruMap frus;
-extern const ipmi::sensor::EntityInfoMap entities;
 
 using namespace phosphor::logging;
 using InternalFailure =
-    sdbusplus::xyz::openbmc_project::Common::Error::InternalFailure;
+    sdbusplus::error::xyz::openbmc_project::common::InternalFailure;
 
 void register_netfn_sen_functions() __attribute__((constructor));
 
@@ -69,27 +79,150 @@ struct sensor_data_t
     uint8_t sennum;
 } __attribute__((packed));
 
-struct sensorreadingresp_t
-{
-    uint8_t value;
-    uint8_t operation;
-    uint8_t indication[2];
-} __attribute__((packed));
+using SDRCacheMap = std::unordered_map<uint8_t, get_sdr::SensorDataFullRecord>;
+SDRCacheMap sdrCacheMap __attribute__((init_priority(101)));
 
-int get_bus_for_path(const char* path, char** busname)
+using SensorThresholdMap =
+    std::unordered_map<uint8_t, get_sdr::GetSensorThresholdsResponse>;
+SensorThresholdMap sensorThresholdMap __attribute__((init_priority(101)));
+
+#ifdef FEATURE_SENSORS_CACHE
+std::map<uint8_t, std::unique_ptr<sdbusplus::bus::match_t>> sensorAddedMatches
+    __attribute__((init_priority(101)));
+std::map<uint8_t, std::unique_ptr<sdbusplus::bus::match_t>> sensorUpdatedMatches
+    __attribute__((init_priority(101)));
+std::map<uint8_t, std::unique_ptr<sdbusplus::bus::match_t>> sensorRemovedMatches
+    __attribute__((init_priority(101)));
+std::unique_ptr<sdbusplus::bus::match_t> sensorsOwnerMatch
+    __attribute__((init_priority(101)));
+
+ipmi::sensor::SensorCacheMap sensorCacheMap __attribute__((init_priority(101)));
+
+// It is needed to know which objects belong to which service, so that when a
+// service exits without interfacesRemoved signal, we could invaildate the cache
+// that is related to the service. It uses below two variables:
+// - idToServiceMap records which sensors are known to have a related service;
+// - serviceToIdMap maps a service to the sensors.
+using sensorIdToServiceMap = std::unordered_map<uint8_t, std::string>;
+sensorIdToServiceMap idToServiceMap __attribute__((init_priority(101)));
+
+using sensorServiceToIdMap = std::unordered_map<std::string, std::set<uint8_t>>;
+sensorServiceToIdMap serviceToIdMap __attribute__((init_priority(101)));
+
+static void fillSensorIdServiceMap(const std::string&,
+                                   const std::string& /*intf*/, uint8_t id,
+                                   const std::string& service)
 {
-    return mapper_get_service(bus, path, busname);
+    if (idToServiceMap.find(id) != idToServiceMap.end())
+    {
+        return;
+    }
+    idToServiceMap[id] = service;
+    serviceToIdMap[service].insert(id);
 }
+
+static void fillSensorIdServiceMap(const std::string& obj,
+                                   const std::string& intf, uint8_t id)
+{
+    if (idToServiceMap.find(id) != idToServiceMap.end())
+    {
+        return;
+    }
+    try
+    {
+        sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
+        auto service = ipmi::getService(bus, intf, obj);
+        idToServiceMap[id] = service;
+        serviceToIdMap[service].insert(id);
+    }
+    catch (...)
+    {
+        // Ignore
+    }
+}
+
+void initSensorMatches()
+{
+    using namespace sdbusplus::bus::match::rules;
+    sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
+    for (const auto& s : ipmi::sensor::sensors)
+    {
+        sensorAddedMatches.emplace(
+            s.first,
+            std::make_unique<sdbusplus::bus::match_t>(
+                bus, interfacesAdded() + argNpath(0, s.second.sensorPath),
+                [id = s.first, obj = s.second.sensorPath,
+                 intf = s.second.propertyInterfaces.begin()->first](
+                    auto& /*msg*/) { fillSensorIdServiceMap(obj, intf, id); }));
+        sensorRemovedMatches.emplace(
+            s.first,
+            std::make_unique<sdbusplus::bus::match_t>(
+                bus, interfacesRemoved() + argNpath(0, s.second.sensorPath),
+                [id = s.first](auto& /*msg*/) {
+                    // Ideally this should work.
+                    // But when a service is terminated or crashed, it does not
+                    // emit interfacesRemoved signal. In that case it's handled
+                    // by sensorsOwnerMatch
+                    sensorCacheMap[id].reset();
+                }));
+        sensorUpdatedMatches.emplace(
+            s.first,
+            std::make_unique<sdbusplus::bus::match_t>(
+                bus,
+                type::signal() + path(s.second.sensorPath) +
+                    member("PropertiesChanged"s) +
+                    interface("org.freedesktop.DBus.Properties"s),
+                [&s](auto& msg) {
+                    fillSensorIdServiceMap(
+                        s.second.sensorPath,
+                        s.second.propertyInterfaces.begin()->first, s.first);
+                    try
+                    {
+                        // This is signal callback
+                        std::string interfaceName;
+                        msg.read(interfaceName);
+                        ipmi::PropertyMap props;
+                        msg.read(props);
+                        s.second.getFunc(s.first, s.second, props);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        sensorCacheMap[s.first].reset();
+                    }
+                }));
+    }
+    sensorsOwnerMatch = std::make_unique<sdbusplus::bus::match_t>(
+        bus, nameOwnerChanged(), [](auto& msg) {
+            std::string name;
+            std::string oldOwner;
+            std::string newOwner;
+            msg.read(name, oldOwner, newOwner);
+
+            if (!name.empty() && newOwner.empty())
+            {
+                // The service exits
+                const auto it = serviceToIdMap.find(name);
+                if (it == serviceToIdMap.end())
+                {
+                    return;
+                }
+                for (const auto& id : it->second)
+                {
+                    // Invalidate cache
+                    sensorCacheMap[id].reset();
+                }
+            }
+        });
+}
+#endif
 
 // Use a lookup table to find the interface name of a specific sensor
 // This will be used until an alternative is found.  this is the first
 // step for mapping IPMI
 int find_openbmc_path(uint8_t num, dbus_interface_t* interface)
 {
-    int rc;
-
-    const auto& sensor_it = sensors.find(num);
-    if (sensor_it == sensors.end())
+    const auto& sensor_it = ipmi::sensor::sensors.find(num);
+    if (sensor_it == ipmi::sensor::sensors.end())
     {
         // The sensor map does not contain the sensor requested
         return -EINVAL;
@@ -97,17 +230,22 @@ int find_openbmc_path(uint8_t num, dbus_interface_t* interface)
 
     const auto& info = sensor_it->second;
 
-    char* busname = nullptr;
-    rc = get_bus_for_path(info.sensorPath.c_str(), &busname);
-    if (rc < 0)
+    std::string serviceName{};
+    try
+    {
+        sdbusplus::bus_t bus{ipmid_get_sd_bus_connection()};
+        serviceName =
+            ipmi::getService(bus, info.sensorInterface, info.sensorPath);
+    }
+    catch (const sdbusplus::exception_t&)
     {
         std::fprintf(stderr, "Failed to get %s busname: %s\n",
-                     info.sensorPath.c_str(), busname);
-        goto final;
+                     info.sensorPath.c_str(), serviceName.c_str());
+        return -EINVAL;
     }
 
     interface->sensortype = info.sensorType;
-    strcpy(interface->bus, busname);
+    strcpy(interface->bus, serviceName.c_str());
     strcpy(interface->path, info.sensorPath.c_str());
     // Take the interface name from the beginning of the DbusInterfaceMap. This
     // works for the Value interface but may not suffice for more complex
@@ -117,9 +255,7 @@ int find_openbmc_path(uint8_t num, dbus_interface_t* interface)
            info.propertyInterfaces.begin()->first.c_str());
     interface->sensornumber = num;
 
-final:
-    free(busname);
-    return rc;
+    return 0;
 }
 
 /////////////////////////////////////////////////////////////////////
@@ -130,7 +266,6 @@ final:
 int set_sensor_dbus_state_s(uint8_t number, const char* method,
                             const char* value)
 {
-
     dbus_interface_t a;
     int r;
     sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -176,7 +311,6 @@ final:
 int set_sensor_dbus_state_y(uint8_t number, const char* method,
                             const uint8_t value)
 {
-
     dbus_interface_t a;
     int r;
     sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -222,7 +356,6 @@ final:
 
 uint8_t dbus_to_sensor_type(char* p)
 {
-
     sensorTypemap_t* s = g_SensorTypeMap;
     char r = 0;
     while (s->number != 0xFF)
@@ -243,7 +376,6 @@ uint8_t dbus_to_sensor_type(char* p)
 
 uint8_t get_type_from_interface(dbus_interface_t dbus_if)
 {
-
     uint8_t type;
 
     // This is where sensors that do not exist in dbus but do
@@ -283,33 +415,32 @@ uint8_t find_type_for_sensor_number(uint8_t num)
     return get_type_from_interface(dbus_if);
 }
 
-ipmi_ret_t ipmi_sen_get_sensor_type(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                    ipmi_request_t request,
-                                    ipmi_response_t response,
-                                    ipmi_data_len_t data_len,
-                                    ipmi_context_t context)
+/**
+ *  @brief implements the get sensor type command.
+ *  @param - sensorNumber
+ *
+ *  @return IPMI completion code plus response data on success.
+ *   - sensorType
+ *   - eventType
+ **/
+
+ipmi::RspType<uint8_t, // sensorType
+              uint8_t  // eventType
+              >
+    ipmiGetSensorType(uint8_t sensorNumber)
 {
-    auto reqptr = static_cast<sensor_data_t*>(request);
-    ipmi_ret_t rc = IPMI_CC_OK;
-
-    printf("IPMI GET_SENSOR_TYPE [0x%02X]\n", reqptr->sennum);
-
-    // TODO Not sure what the System-event-sensor is suppose to return
-    // need to ask Hostboot team
-    unsigned char buf[] = {0x00, 0x6F};
-
-    buf[0] = find_type_for_sensor_number(reqptr->sennum);
-
-    // HACK UNTIL Dbus gets updated or we find a better way
-    if (buf[0] == 0)
+    const auto it = ipmi::sensor::sensors.find(sensorNumber);
+    if (it == ipmi::sensor::sensors.end())
     {
-        rc = IPMI_CC_SENSOR_INVALID;
+        // The sensor map does not contain the sensor requested
+        return ipmi::responseSensorInvalid();
     }
 
-    *data_len = sizeof(buf);
-    std::memcpy(response, &buf, *data_len);
+    const auto& info = it->second;
+    uint8_t sensorType = info.sensorType;
+    uint8_t eventType = info.sensorReadingType;
 
-    return rc;
+    return ipmi::responseSuccess(sensorType, eventType);
 }
 
 const std::set<std::string> analogSensorInterfaces = {
@@ -322,16 +453,56 @@ bool isAnalogSensor(const std::string& interface)
     return (analogSensorInterfaces.count(interface));
 }
 
-ipmi_ret_t setSensorReading(void* request)
+/**
+@brief This command is used to set sensorReading.
+
+@param
+    -  sensorNumber
+    -  operation
+    -  reading
+    -  assertOffset0_7
+    -  assertOffset8_14
+    -  deassertOffset0_7
+    -  deassertOffset8_14
+    -  eventData1
+    -  eventData2
+    -  eventData3
+
+@return completion code on success.
+**/
+
+ipmi::RspType<> ipmiSetSensorReading(
+    uint8_t sensorNumber, uint8_t operation, uint8_t reading,
+    uint8_t assertOffset0_7, uint8_t assertOffset8_14,
+    uint8_t deassertOffset0_7, uint8_t deassertOffset8_14, uint8_t eventData1,
+    uint8_t eventData2, uint8_t eventData3)
 {
-    ipmi::sensor::SetSensorReadingReq cmdData =
-        *(static_cast<ipmi::sensor::SetSensorReadingReq*>(request));
+    lg2::debug("IPMI SET_SENSOR, sensorNumber: {SENSOR_NUM}", "SENSOR_NUM",
+               lg2::hex, sensorNumber);
+
+    if (sensorNumber == 0xFF)
+    {
+        return ipmi::responseInvalidFieldRequest();
+    }
+    ipmi::sensor::SetSensorReadingReq cmdData;
+
+    cmdData.number = sensorNumber;
+    cmdData.operation = operation;
+    cmdData.reading = reading;
+    cmdData.assertOffset0_7 = assertOffset0_7;
+    cmdData.assertOffset8_14 = assertOffset8_14;
+    cmdData.deassertOffset0_7 = deassertOffset0_7;
+    cmdData.deassertOffset8_14 = deassertOffset8_14;
+    cmdData.eventData1 = eventData1;
+    cmdData.eventData2 = eventData2;
+    cmdData.eventData3 = eventData3;
 
     // Check if the Sensor Number is present
-    const auto iter = sensors.find(cmdData.number);
-    if (iter == sensors.end())
+    const auto iter = ipmi::sensor::sensors.find(sensorNumber);
+    if (iter == ipmi::sensor::sensors.end())
     {
-        return IPMI_CC_SENSOR_INVALID;
+        updateSensorRecordFromSSRAESC(&sensorNumber);
+        return ipmi::responseSuccess();
     }
 
     try
@@ -339,178 +510,331 @@ ipmi_ret_t setSensorReading(void* request)
         if (ipmi::sensor::Mutability::Write !=
             (iter->second.mutability & ipmi::sensor::Mutability::Write))
         {
-            log<level::ERR>("Sensor Set operation is not allowed",
-                            entry("SENSOR_NUM=%d", cmdData.number));
-            return IPMI_CC_ILLEGAL_COMMAND;
+            lg2::error("Sensor Set operation is not allowed, "
+                       "sensorNumber: {SENSOR_NUM}",
+                       "SENSOR_NUM", lg2::hex, sensorNumber);
+            return ipmi::responseIllegalCommand();
         }
-        return iter->second.updateFunc(cmdData, iter->second);
+        auto ipmiRC = iter->second.updateFunc(cmdData, iter->second);
+        return ipmi::response(ipmiRC);
     }
-    catch (InternalFailure& e)
+    catch (const InternalFailure& e)
     {
-        log<level::ERR>("Set sensor failed",
-                        entry("SENSOR_NUM=%d", cmdData.number));
+        lg2::error("Set sensor failed, sensorNumber: {SENSOR_NUM}",
+                   "SENSOR_NUM", lg2::hex, sensorNumber);
         commit<InternalFailure>();
+        return ipmi::responseUnspecifiedError();
     }
     catch (const std::runtime_error& e)
     {
-        log<level::ERR>(e.what());
+        lg2::error("runtime error: {ERROR}", "ERROR", e);
+        return ipmi::responseUnspecifiedError();
     }
-
-    return IPMI_CC_UNSPECIFIED_ERROR;
 }
 
-ipmi_ret_t ipmi_sen_set_sensor(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                               ipmi_request_t request, ipmi_response_t response,
-                               ipmi_data_len_t data_len, ipmi_context_t context)
+/** @brief implements the get sensor reading command
+ *  @param sensorNum - sensor number
+ *
+ *  @returns IPMI completion code plus response data
+ *   - senReading           - sensor reading
+ *   - reserved
+ *   - readState            - sensor reading state enabled
+ *   - senScanState         - sensor scan state disabled
+ *   - allEventMessageState - all Event message state disabled
+ *   - assertionStatesLsb   - threshold levels states
+ *   - assertionStatesMsb   - discrete reading sensor states
+ */
+ipmi::RspType<uint8_t, // sensor reading
+
+              uint5_t, // reserved
+              bool,    // reading state
+              bool,    // 0 = sensor scanning state disabled
+              bool,    // 0 = all event messages disabled
+
+              uint8_t, // threshold levels states
+              uint8_t  // discrete reading sensor states
+              >
+    ipmiSensorGetSensorReading([[maybe_unused]] ipmi::Context::ptr& ctx,
+                               uint8_t sensorNum)
 {
-    auto reqptr = static_cast<sensor_data_t*>(request);
-
-    log<level::DEBUG>("IPMI SET_SENSOR",
-                      entry("SENSOR_NUM=0x%02x", reqptr->sennum));
-
-    /*
-     * This would support the Set Sensor Reading command for the presence
-     * and functional state of Processor, Core & DIMM. For the remaining
-     * sensors the existing support is invoked.
-     */
-    auto ipmiRC = setSensorReading(request);
-
-    if (ipmiRC == IPMI_CC_SENSOR_INVALID)
+    if (sensorNum == 0xFF)
     {
-        updateSensorRecordFromSSRAESC(reqptr);
-        ipmiRC = IPMI_CC_OK;
+        return ipmi::responseInvalidFieldRequest();
     }
 
-    *data_len = 0;
-    return ipmiRC;
-}
-
-ipmi_ret_t ipmi_sen_get_sensor_reading(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                       ipmi_request_t request,
-                                       ipmi_response_t response,
-                                       ipmi_data_len_t data_len,
-                                       ipmi_context_t context)
-{
-    auto reqptr = static_cast<sensor_data_t*>(request);
-    auto resp = static_cast<sensorreadingresp_t*>(response);
-    ipmi::sensor::GetSensorResponse getResponse{};
-    static constexpr auto scanningEnabledBit = 6;
-
-    const auto iter = sensors.find(reqptr->sennum);
-    if (iter == sensors.end())
+    const auto iter = ipmi::sensor::sensors.find(sensorNum);
+    if (iter == ipmi::sensor::sensors.end())
     {
-        return IPMI_CC_SENSOR_INVALID;
+        return ipmi::responseSensorInvalid();
     }
     if (ipmi::sensor::Mutability::Read !=
         (iter->second.mutability & ipmi::sensor::Mutability::Read))
     {
-        return IPMI_CC_ILLEGAL_COMMAND;
+        return ipmi::responseIllegalCommand();
     }
 
     try
     {
-        getResponse = iter->second.getFunc(iter->second);
-        *data_len = getResponse.size();
-        std::memcpy(resp, getResponse.data(), *data_len);
-        resp->operation = 1 << scanningEnabledBit;
-        return IPMI_CC_OK;
+#ifdef FEATURE_SENSORS_CACHE
+        auto& sensorData = sensorCacheMap[sensorNum];
+        if (!sensorData.has_value())
+        {
+            // No cached value, try read it
+            std::string service;
+            boost::system::error_code ec;
+            const auto& sensorInfo = iter->second;
+            ec = ipmi::getService(ctx, sensorInfo.sensorInterface,
+                                  sensorInfo.sensorPath, service);
+            if (ec)
+            {
+                return ipmi::responseUnspecifiedError();
+            }
+            fillSensorIdServiceMap(sensorInfo.sensorPath,
+                                   sensorInfo.propertyInterfaces.begin()->first,
+                                   iter->first, service);
+
+            ipmi::PropertyMap props;
+            ec = ipmi::getAllDbusProperties(
+                ctx, service, sensorInfo.sensorPath,
+                sensorInfo.propertyInterfaces.begin()->first, props);
+            if (ec)
+            {
+                fprintf(stderr, "Failed to get sensor %s, %d: %s\n",
+                        sensorInfo.sensorPath.c_str(), ec.value(),
+                        ec.message().c_str());
+                // Intitilizing with default values
+                constexpr uint8_t senReading = 0;
+                constexpr uint5_t reserved{0};
+                constexpr bool readState = true;
+                constexpr bool senScanState = false;
+                constexpr bool allEventMessageState = false;
+                constexpr uint8_t assertionStatesLsb = 0;
+                constexpr uint8_t assertionStatesMsb = 0;
+
+                return ipmi::responseSuccess(
+                    senReading, reserved, readState, senScanState,
+                    allEventMessageState, assertionStatesLsb,
+                    assertionStatesMsb);
+            }
+            sensorInfo.getFunc(sensorNum, sensorInfo, props);
+        }
+        return ipmi::responseSuccess(
+            sensorData->response.reading, uint5_t(0),
+            sensorData->response.readingOrStateUnavailable,
+            sensorData->response.scanningEnabled,
+            sensorData->response.allEventMessagesEnabled,
+            sensorData->response.thresholdLevelsStates,
+            sensorData->response.discreteReadingSensorStates);
+
+#else
+        ipmi::sensor::GetSensorResponse getResponse =
+            iter->second.getFunc(iter->second);
+
+        return ipmi::responseSuccess(
+            getResponse.reading, uint5_t(0),
+            getResponse.readingOrStateUnavailable, getResponse.scanningEnabled,
+            getResponse.allEventMessagesEnabled,
+            getResponse.thresholdLevelsStates,
+            getResponse.discreteReadingSensorStates);
+#endif
     }
+#ifdef UPDATE_FUNCTIONAL_ON_FAIL
+    catch (const SensorFunctionalError& e)
+    {
+        return ipmi::responseResponseError();
+    }
+#endif
     catch (const std::exception& e)
     {
-        *data_len = getResponse.size();
-        std::memcpy(resp, getResponse.data(), *data_len);
-        return IPMI_CC_OK;
+        // Intitilizing with default values
+        constexpr uint8_t senReading = 0;
+        constexpr uint5_t reserved{0};
+        constexpr bool readState = true;
+        constexpr bool senScanState = false;
+        constexpr bool allEventMessageState = false;
+        constexpr uint8_t assertionStatesLsb = 0;
+        constexpr uint8_t assertionStatesMsb = 0;
+
+        return ipmi::responseSuccess(senReading, reserved, readState,
+                                     senScanState, allEventMessageState,
+                                     assertionStatesLsb, assertionStatesMsb);
     }
 }
 
-void getSensorThresholds(uint8_t sensorNum,
-                         get_sdr::GetSensorThresholdsResponse* response)
+void updateWarningThreshold(uint8_t lowerValue, uint8_t upperValue,
+                            get_sdr::GetSensorThresholdsResponse& resp)
 {
-    constexpr auto warningThreshIntf =
-        "xyz.openbmc_project.Sensor.Threshold.Warning";
-    constexpr auto criticalThreshIntf =
-        "xyz.openbmc_project.Sensor.Threshold.Critical";
-
-    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
-
-    const auto iter = sensors.find(sensorNum);
-    const auto info = iter->second;
-
-    auto service = ipmi::getService(bus, info.sensorInterface, info.sensorPath);
-
-    auto warnThresholds = ipmi::getAllDbusProperties(
-        bus, service, info.sensorPath, warningThreshIntf);
-
-    double warnLow = std::visit(ipmi::VariantToDoubleVisitor(),
-                                warnThresholds["WarningLow"]);
-    double warnHigh = std::visit(ipmi::VariantToDoubleVisitor(),
-                                 warnThresholds["WarningHigh"]);
-
-    if (warnLow != 0)
+    resp.lowerNonCritical = lowerValue;
+    resp.upperNonCritical = upperValue;
+    if (lowerValue)
     {
-        warnLow *= std::pow(10, info.scale - info.exponentR);
-        response->lowerNonCritical = static_cast<uint8_t>(
-            (warnLow - info.scaledOffset) / info.coefficientM);
-        response->validMask |= static_cast<uint8_t>(
+        resp.validMask |= static_cast<uint8_t>(
             ipmi::sensor::ThresholdMask::NON_CRITICAL_LOW_MASK);
     }
 
-    if (warnHigh != 0)
+    if (upperValue)
     {
-        warnHigh *= std::pow(10, info.scale - info.exponentR);
-        response->upperNonCritical = static_cast<uint8_t>(
-            (warnHigh - info.scaledOffset) / info.coefficientM);
-        response->validMask |= static_cast<uint8_t>(
+        resp.validMask |= static_cast<uint8_t>(
             ipmi::sensor::ThresholdMask::NON_CRITICAL_HIGH_MASK);
     }
+}
 
-    auto critThresholds = ipmi::getAllDbusProperties(
-        bus, service, info.sensorPath, criticalThreshIntf);
-    double critLow = std::visit(ipmi::VariantToDoubleVisitor(),
-                                critThresholds["CriticalLow"]);
-    double critHigh = std::visit(ipmi::VariantToDoubleVisitor(),
-                                 critThresholds["CriticalHigh"]);
-
-    if (critLow != 0)
+void updateCriticalThreshold(uint8_t lowerValue, uint8_t upperValue,
+                             get_sdr::GetSensorThresholdsResponse& resp)
+{
+    resp.lowerCritical = lowerValue;
+    resp.upperCritical = upperValue;
+    if (lowerValue)
     {
-        critLow *= std::pow(10, info.scale - info.exponentR);
-        response->lowerCritical = static_cast<uint8_t>(
-            (critLow - info.scaledOffset) / info.coefficientM);
-        response->validMask |= static_cast<uint8_t>(
+        resp.validMask |= static_cast<uint8_t>(
             ipmi::sensor::ThresholdMask::CRITICAL_LOW_MASK);
     }
 
-    if (critHigh != 0)
+    if (upperValue)
     {
-        critHigh *= std::pow(10, info.scale - info.exponentR);
-        response->upperCritical = static_cast<uint8_t>(
-            (critHigh - info.scaledOffset) / info.coefficientM);
-        response->validMask |= static_cast<uint8_t>(
+        resp.validMask |= static_cast<uint8_t>(
             ipmi::sensor::ThresholdMask::CRITICAL_HIGH_MASK);
     }
 }
 
-ipmi_ret_t ipmi_sen_get_sensor_thresholds(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                          ipmi_request_t request,
-                                          ipmi_response_t response,
-                                          ipmi_data_len_t data_len,
-                                          ipmi_context_t context)
+void updateNonRecoverableThreshold(uint8_t lowerValue, uint8_t upperValue,
+                                   get_sdr::GetSensorThresholdsResponse& resp)
+{
+    resp.lowerNonRecoverable = lowerValue;
+    resp.upperNonRecoverable = upperValue;
+    if (lowerValue)
+    {
+        resp.validMask |= static_cast<uint8_t>(
+            ipmi::sensor::ThresholdMask::NON_RECOVERABLE_LOW_MASK);
+    }
+
+    if (upperValue)
+    {
+        resp.validMask |= static_cast<uint8_t>(
+            ipmi::sensor::ThresholdMask::NON_RECOVERABLE_HIGH_MASK);
+    }
+}
+
+get_sdr::GetSensorThresholdsResponse
+    getSensorThresholds(ipmi::Context::ptr& ctx, uint8_t sensorNum)
+{
+    get_sdr::GetSensorThresholdsResponse resp{};
+    const auto iter = ipmi::sensor::sensors.find(sensorNum);
+    const auto info = iter->second;
+
+    std::string service;
+    boost::system::error_code ec;
+    ec = ipmi::getService(ctx, info.sensorInterface, info.sensorPath, service);
+    if (ec)
+    {
+        return resp;
+    }
+
+    int32_t minClamp;
+    int32_t maxClamp;
+    int32_t rawData;
+    constexpr uint8_t sensorUnitsSignedBits = 2 << 6;
+    constexpr uint8_t signedDataFormat = 0x80;
+    if ((info.sensorUnits1 & sensorUnitsSignedBits) == signedDataFormat)
+    {
+        minClamp = std::numeric_limits<int8_t>::lowest();
+        maxClamp = std::numeric_limits<int8_t>::max();
+    }
+    else
+    {
+        minClamp = std::numeric_limits<uint8_t>::lowest();
+        maxClamp = std::numeric_limits<uint8_t>::max();
+    }
+
+    static std::vector<std::string> thresholdNames{"Warning", "Critical",
+                                                   "NonRecoverable"};
+
+    for (const auto& thresholdName : thresholdNames)
+    {
+        std::string thresholdInterface =
+            "xyz.openbmc_project.Sensor.Threshold." + thresholdName;
+        std::string thresholdLow = thresholdName + "Low";
+        std::string thresholdHigh = thresholdName + "High";
+
+        ipmi::PropertyMap thresholds;
+        ec = ipmi::getAllDbusProperties(ctx, service, info.sensorPath,
+                                        thresholdInterface, thresholds);
+        if (ec)
+        {
+            continue;
+        }
+
+        double lowValue = ipmi::mappedVariant<double>(
+            thresholds, thresholdLow, std::numeric_limits<double>::quiet_NaN());
+        double highValue = ipmi::mappedVariant<double>(
+            thresholds, thresholdHigh,
+            std::numeric_limits<double>::quiet_NaN());
+
+        uint8_t lowerValue = 0;
+        uint8_t upperValue = 0;
+        if (std::isfinite(lowValue))
+        {
+            lowValue *= std::pow(10, info.scale - info.exponentR);
+            rawData = round((lowValue - info.scaledOffset) / info.coefficientM);
+            lowerValue =
+                static_cast<uint8_t>(std::clamp(rawData, minClamp, maxClamp));
+        }
+
+        if (std::isfinite(highValue))
+        {
+            highValue *= std::pow(10, info.scale - info.exponentR);
+            rawData =
+                round((highValue - info.scaledOffset) / info.coefficientM);
+            upperValue =
+                static_cast<uint8_t>(std::clamp(rawData, minClamp, maxClamp));
+        }
+
+        if (thresholdName == "Warning")
+        {
+            updateWarningThreshold(lowerValue, upperValue, resp);
+        }
+        else if (thresholdName == "Critical")
+        {
+            updateCriticalThreshold(lowerValue, upperValue, resp);
+        }
+        else if (thresholdName == "NonRecoverable")
+        {
+            updateNonRecoverableThreshold(lowerValue, upperValue, resp);
+        }
+    }
+
+    return resp;
+}
+
+/** @brief implements the get sensor thresholds command
+ *  @param ctx - IPMI context pointer
+ *  @param sensorNum - sensor number
+ *
+ *  @returns IPMI completion code plus response data
+ *   - validMask - threshold mask
+ *   - lower non-critical threshold - IPMI messaging state
+ *   - lower critical threshold - link authentication state
+ *   - lower non-recoverable threshold - callback state
+ *   - upper non-critical threshold
+ *   - upper critical
+ *   - upper non-recoverable
+ */
+ipmi::RspType<uint8_t, // validMask
+              uint8_t, // lowerNonCritical
+              uint8_t, // lowerCritical
+              uint8_t, // lowerNonRecoverable
+              uint8_t, // upperNonCritical
+              uint8_t, // upperCritical
+              uint8_t  // upperNonRecoverable
+              >
+    ipmiSensorGetSensorThresholds(ipmi::Context::ptr& ctx, uint8_t sensorNum)
 {
     constexpr auto valueInterface = "xyz.openbmc_project.Sensor.Value";
 
-    if (*data_len != sizeof(uint8_t))
+    const auto iter = ipmi::sensor::sensors.find(sensorNum);
+    if (iter == ipmi::sensor::sensors.end())
     {
-        *data_len = 0;
-        return IPMI_CC_REQ_DATA_LEN_INVALID;
-    }
-
-    auto sensorNum = *(reinterpret_cast<const uint8_t*>(request));
-    *data_len = 0;
-
-    const auto iter = sensors.find(sensorNum);
-    if (iter == sensors.end())
-    {
-        return IPMI_CC_SENSOR_INVALID;
+        return ipmi::responseSensorInvalid();
     }
 
     const auto info = iter->second;
@@ -520,88 +844,244 @@ ipmi_ret_t ipmi_sen_get_sensor_thresholds(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
         info.propertyInterfaces.end())
     {
         // return with valid mask as 0
-        return IPMI_CC_OK;
+        return ipmi::responseSuccess();
     }
 
-    auto responseData =
-        reinterpret_cast<get_sdr::GetSensorThresholdsResponse*>(response);
-
-    try
+    auto it = sensorThresholdMap.find(sensorNum);
+    if (it == sensorThresholdMap.end())
     {
-        getSensorThresholds(sensorNum, responseData);
-    }
-    catch (std::exception& e)
-    {
-        // Mask if the property is not present
-        responseData->validMask = 0;
+        auto resp = getSensorThresholds(ctx, sensorNum);
+        if (resp.validMask == 0)
+        {
+            return ipmi::responseSensorInvalid();
+        }
+        sensorThresholdMap[sensorNum] = std::move(resp);
     }
 
-    *data_len = sizeof(get_sdr::GetSensorThresholdsResponse);
-    return IPMI_CC_OK;
+    const auto& resp = sensorThresholdMap[sensorNum];
+
+    return ipmi::responseSuccess(
+        resp.validMask, resp.lowerNonCritical, resp.lowerCritical,
+        resp.lowerNonRecoverable, resp.upperNonCritical, resp.upperCritical,
+        resp.upperNonRecoverable);
 }
 
-ipmi_ret_t ipmi_sen_wildcard(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                             ipmi_request_t request, ipmi_response_t response,
-                             ipmi_data_len_t data_len, ipmi_context_t context)
+/** @brief implements the Set Sensor threshold command
+ *  @param sensorNumber        - sensor number
+ *  @param lowerNonCriticalThreshMask
+ *  @param lowerCriticalThreshMask
+ *  @param lowerNonRecovThreshMask
+ *  @param upperNonCriticalThreshMask
+ *  @param upperCriticalThreshMask
+ *  @param upperNonRecovThreshMask
+ *  @param reserved
+ *  @param lowerNonCritical    - lower non-critical threshold
+ *  @param lowerCritical       - Lower critical threshold
+ *  @param lowerNonRecoverable - Lower non recovarable threshold
+ *  @param upperNonCritical    - Upper non-critical threshold
+ *  @param upperCritical       - Upper critical
+ *  @param upperNonRecoverable - Upper Non-recoverable
+ *
+ *  @returns IPMI completion code
+ */
+ipmi::RspType<> ipmiSenSetSensorThresholds(
+    ipmi::Context::ptr& ctx, uint8_t sensorNum, bool lowerNonCriticalThreshMask,
+    bool lowerCriticalThreshMask, bool lowerNonRecovThreshMask,
+    bool upperNonCriticalThreshMask, bool upperCriticalThreshMask,
+    bool upperNonRecovThreshMask, uint2_t reserved, uint8_t lowerNonCritical,
+    uint8_t lowerCritical, uint8_t, uint8_t upperNonCritical,
+    uint8_t upperCritical, uint8_t)
 {
-    ipmi_ret_t rc = IPMI_CC_INVALID;
+    if (reserved)
+    {
+        return ipmi::responseInvalidFieldRequest();
+    }
 
-    printf("IPMI S/E Wildcard Netfn:[0x%X], Cmd:[0x%X]\n", netfn, cmd);
-    *data_len = 0;
+    // lower nc and upper nc not suppported on any sensor
+    if (lowerNonRecovThreshMask || upperNonRecovThreshMask)
+    {
+        return ipmi::responseInvalidFieldRequest();
+    }
 
-    return rc;
+    // if none of the threshold mask are set, nothing to do
+    if (!(lowerNonCriticalThreshMask | lowerCriticalThreshMask |
+          lowerNonRecovThreshMask | upperNonCriticalThreshMask |
+          upperCriticalThreshMask | upperNonRecovThreshMask))
+    {
+        return ipmi::responseSuccess();
+    }
+
+    constexpr auto valueInterface = "xyz.openbmc_project.Sensor.Value";
+
+    const auto iter = ipmi::sensor::sensors.find(sensorNum);
+    if (iter == ipmi::sensor::sensors.end())
+    {
+        return ipmi::responseSensorInvalid();
+    }
+
+    const auto& info = iter->second;
+
+    // Proceed only if the sensor value interface is implemented.
+    if (info.propertyInterfaces.find(valueInterface) ==
+        info.propertyInterfaces.end())
+    {
+        // return with valid mask as 0
+        return ipmi::responseSuccess();
+    }
+
+    constexpr auto warningThreshIntf =
+        "xyz.openbmc_project.Sensor.Threshold.Warning";
+    constexpr auto criticalThreshIntf =
+        "xyz.openbmc_project.Sensor.Threshold.Critical";
+
+    std::string service;
+    boost::system::error_code ec;
+    ec = ipmi::getService(ctx, info.sensorInterface, info.sensorPath, service);
+    if (ec)
+    {
+        return ipmi::responseResponseError();
+    }
+    // store a vector of property name, value to set, and interface
+    std::vector<std::tuple<std::string, uint8_t, std::string>> thresholdsToSet;
+
+    // define the indexes of the tuple
+    constexpr uint8_t propertyName = 0;
+    constexpr uint8_t thresholdValue = 1;
+    constexpr uint8_t interface = 2;
+    // verifiy all needed fields are present
+    if (lowerCriticalThreshMask || upperCriticalThreshMask)
+    {
+        ipmi::PropertyMap findThreshold;
+        ec = ipmi::getAllDbusProperties(ctx, service, info.sensorPath,
+                                        criticalThreshIntf, findThreshold);
+
+        if (!ec)
+        {
+            if (lowerCriticalThreshMask)
+            {
+                auto findLower = findThreshold.find("CriticalLow");
+                if (findLower == findThreshold.end())
+                {
+                    return ipmi::responseInvalidFieldRequest();
+                }
+                thresholdsToSet.emplace_back("CriticalLow", lowerCritical,
+                                             criticalThreshIntf);
+            }
+            if (upperCriticalThreshMask)
+            {
+                auto findUpper = findThreshold.find("CriticalHigh");
+                if (findUpper == findThreshold.end())
+                {
+                    return ipmi::responseInvalidFieldRequest();
+                }
+                thresholdsToSet.emplace_back("CriticalHigh", upperCritical,
+                                             criticalThreshIntf);
+            }
+        }
+    }
+    if (lowerNonCriticalThreshMask || upperNonCriticalThreshMask)
+    {
+        ipmi::PropertyMap findThreshold;
+        ec = ipmi::getAllDbusProperties(ctx, service, info.sensorPath,
+                                        warningThreshIntf, findThreshold);
+
+        if (!ec)
+        {
+            if (lowerNonCriticalThreshMask)
+            {
+                auto findLower = findThreshold.find("WarningLow");
+                if (findLower == findThreshold.end())
+                {
+                    return ipmi::responseInvalidFieldRequest();
+                }
+                thresholdsToSet.emplace_back("WarningLow", lowerNonCritical,
+                                             warningThreshIntf);
+            }
+            if (upperNonCriticalThreshMask)
+            {
+                auto findUpper = findThreshold.find("WarningHigh");
+                if (findUpper == findThreshold.end())
+                {
+                    return ipmi::responseInvalidFieldRequest();
+                }
+                thresholdsToSet.emplace_back("WarningHigh", upperNonCritical,
+                                             warningThreshIntf);
+            }
+        }
+    }
+    for (const auto& property : thresholdsToSet)
+    {
+        // from section 36.3 in the IPMI Spec, assume all linear
+        double valueToSet =
+            ((info.coefficientM * std::get<thresholdValue>(property)) +
+             (info.scaledOffset * std::pow(10.0, info.scale))) *
+            std::pow(10.0, info.exponentR);
+        ipmi::setDbusProperty(
+            ctx, service, info.sensorPath, std::get<interface>(property),
+            std::get<propertyName>(property), ipmi::Value(valueToSet));
+    }
+
+    // Invalidate the cache
+    sensorThresholdMap.erase(sensorNum);
+    return ipmi::responseSuccess();
 }
 
-ipmi_ret_t ipmi_sen_get_sdr_info(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                 ipmi_request_t request,
-                                 ipmi_response_t response,
-                                 ipmi_data_len_t data_len,
-                                 ipmi_context_t context)
+/** @brief implements the get SDR Info command
+ *  @param count - Operation
+ *
+ *  @returns IPMI completion code plus response data
+ *   - sdrCount - sensor/SDR count
+ *   - lunsAndDynamicPopulation - static/Dynamic sensor population flag
+ */
+ipmi::RspType<uint8_t, // respcount
+              uint8_t  // dynamic population flags
+              >
+    ipmiSensorGetDeviceSdrInfo(std::optional<uint8_t> count)
 {
-    auto resp = static_cast<get_sdr_info::GetSdrInfoResp*>(response);
-    if (request == nullptr ||
-        get_sdr_info::request::get_count(request) == false)
+    uint8_t sdrCount;
+    // multiple LUNs not supported.
+    constexpr uint8_t lunsAndDynamicPopulation = 1;
+    constexpr uint8_t getSdrCount = 0x01;
+    constexpr uint8_t getSensorCount = 0x00;
+
+    if (count.value_or(0) == getSdrCount)
     {
-        // Get Sensor Count
-        resp->count = sensors.size() + frus.size() + entities.size();
+        // Get SDR count. This returns the total number of SDRs in the device.
+        const auto& entityRecords =
+            ipmi::sensor::EntityInfoMapContainer::getContainer()
+                ->getIpmiEntityRecords();
+        sdrCount = ipmi::sensor::sensors.size() + frus.size() +
+                   entityRecords.size();
+    }
+    else if (count.value_or(0) == getSensorCount)
+    {
+        // Get Sensor count. This returns the number of sensors
+        sdrCount = ipmi::sensor::sensors.size();
     }
     else
     {
-        resp->count = 1;
+        return ipmi::responseInvalidCommandOnLun();
     }
 
-    // Multiple LUNs not supported.
-    namespace response = get_sdr_info::response;
-    response::set_lun_present(0, &(resp->luns_and_dynamic_population));
-    response::set_lun_not_present(1, &(resp->luns_and_dynamic_population));
-    response::set_lun_not_present(2, &(resp->luns_and_dynamic_population));
-    response::set_lun_not_present(3, &(resp->luns_and_dynamic_population));
-    response::set_static_population(&(resp->luns_and_dynamic_population));
-
-    *data_len = SDR_INFO_RESP_SIZE;
-
-    return IPMI_CC_OK;
+    return ipmi::responseSuccess(sdrCount, lunsAndDynamicPopulation);
 }
 
-ipmi_ret_t ipmi_sen_reserve_sdr(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                ipmi_request_t request,
-                                ipmi_response_t response,
-                                ipmi_data_len_t data_len,
-                                ipmi_context_t context)
+/** @brief implements the reserve SDR command
+ *  @returns IPMI completion code plus response data
+ *   - reservationID - reservation ID
+ */
+ipmi::RspType<uint16_t> ipmiSensorReserveSdr()
 {
     // A constant reservation ID is okay until we implement add/remove SDR.
-    const uint16_t reservation_id = 1;
-    *(uint16_t*)response = reservation_id;
-    *data_len = sizeof(uint16_t);
+    constexpr uint16_t reservationID = 1;
 
-    printf("Created new IPMI SDR reservation ID %d\n", *(uint16_t*)response);
-    return IPMI_CC_OK;
+    return ipmi::responseSuccess(reservationID);
 }
 
 void setUnitFieldsForObject(const ipmi::sensor::Info* info,
                             get_sdr::SensorDataFullRecordBody* body)
 {
-    namespace server = sdbusplus::xyz::openbmc_project::Sensor::server;
+    namespace server = sdbusplus::server::xyz::openbmc_project::sensor;
     try
     {
         auto unit = server::Value::convertUnitFromString(info->unit);
@@ -638,20 +1118,19 @@ void setUnitFieldsForObject(const ipmi::sensor::Info* info,
     }
     catch (const sdbusplus::exception::InvalidEnumString& e)
     {
-        log<level::WARNING>("Warning: no unit provided for sensor!");
+        lg2::warning("Warning: no unit provided for sensor!");
     }
 }
 
 ipmi_ret_t populate_record_from_dbus(get_sdr::SensorDataFullRecordBody* body,
                                      const ipmi::sensor::Info* info,
-                                     ipmi_data_len_t data_len)
+                                     ipmi_data_len_t)
 {
     /* Functional sensor case */
     if (isAnalogSensor(info->propertyInterfaces.begin()->first))
     {
-
-        body->sensor_units_1 = 0; // unsigned, no rate, no modifier, not a %
-
+        body->sensor_units_1 = info->sensorUnits1; // default is 0. unsigned, no
+                                                   // rate, no modifier, not a %
         /* Unit info */
         setUnitFieldsForObject(info, body);
 
@@ -659,12 +1138,15 @@ ipmi_ret_t populate_record_from_dbus(get_sdr::SensorDataFullRecordBody* body,
         get_sdr::body::set_m(info->coefficientM, body);
         get_sdr::body::set_b_exp(info->exponentB, body);
         get_sdr::body::set_r_exp(info->exponentR, body);
-
-        get_sdr::body::set_id_type(0b00, body); // 00 = unicode
     }
 
     /* ID string */
-    auto id_string = info->sensorNameFunc(*info);
+    auto id_string = info->sensorName;
+
+    if (id_string.empty())
+    {
+        id_string = info->sensorNameFunc(*info);
+    }
 
     if (id_string.length() > FULL_RECORD_ID_STR_MAX_LENGTH)
     {
@@ -674,6 +1156,7 @@ ipmi_ret_t populate_record_from_dbus(get_sdr::SensorDataFullRecordBody* body,
     {
         get_sdr::body::set_id_strlen(id_string.length(), body);
     }
+    get_sdr::body::set_id_type(3, body); // "8-bit ASCII + Latin 1"
     strncpy(body->id_string, id_string.c_str(),
             get_sdr::body::get_id_strlen(body));
 
@@ -708,7 +1191,7 @@ ipmi_ret_t ipmi_fru_get_sdr(ipmi_request_t request, ipmi_response_t response,
     /* Key */
     record.key.fruID = fruID;
     record.key.accessLun |= IPMI_LOGICAL_FRU;
-    record.key.deviceAddress = BMCSlaveAddress;
+    record.key.deviceAddress = BMCTargetAddress;
 
     /* Body */
     record.body.entityID = fru->second[0].entityID;
@@ -738,9 +1221,13 @@ ipmi_ret_t ipmi_fru_get_sdr(ipmi_request_t request, ipmi_response_t response,
     {
         // we have reached till end of fru, so assign the next record id to
         // 512(Max fru ID = 511) + Entity Record ID(may start with 0).
+        const auto& entityRecords =
+            ipmi::sensor::EntityInfoMapContainer::getContainer()
+                ->getIpmiEntityRecords();
         auto next_record_id =
-            (entities.size()) ? entities.begin()->first + ENTITY_RECORD_ID_START
-                              : END_OF_RECORD;
+            (entityRecords.size())
+                ? entityRecords.begin()->first + ENTITY_RECORD_ID_START
+                : END_OF_RECORD;
         get_sdr::response::set_next_record_id(next_record_id, resp);
     }
     else
@@ -775,13 +1262,16 @@ ipmi_ret_t ipmi_entity_get_sdr(ipmi_request_t request, ipmi_response_t response,
     get_sdr::SensorDataEntityRecord record{};
     auto dataLength = 0;
 
-    auto entity = entities.begin();
+    const auto& entityRecords =
+        ipmi::sensor::EntityInfoMapContainer::getContainer()
+            ->getIpmiEntityRecords();
+    auto entity = entityRecords.begin();
     uint8_t entityRecordID;
     auto recordID = get_sdr::request::get_record_id(req);
 
     entityRecordID = recordID - ENTITY_RECORD_ID_START;
-    entity = entities.find(entityRecordID);
-    if (entity == entities.end())
+    entity = entityRecords.find(entityRecordID);
+    if (entity == entityRecords.end())
     {
         return IPMI_CC_SENSOR_INVALID;
     }
@@ -808,7 +1298,7 @@ ipmi_ret_t ipmi_entity_get_sdr(ipmi_request_t request, ipmi_response_t response,
     record.body.entityId4 = entity->second.containedEntities[3].first;
     record.body.entityInstance4 = entity->second.containedEntities[3].second;
 
-    if (++entity == entities.end())
+    if (++entity == entityRecords.end())
     {
         get_sdr::response::set_next_record_id(END_OF_RECORD,
                                               resp); // last record
@@ -837,55 +1327,57 @@ ipmi_ret_t ipmi_entity_get_sdr(ipmi_request_t request, ipmi_response_t response,
     return IPMI_CC_OK;
 }
 
-ipmi_ret_t ipmi_sen_get_sdr(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                            ipmi_request_t request, ipmi_response_t response,
-                            ipmi_data_len_t data_len, ipmi_context_t context)
+ipmi_ret_t ipmi_sen_get_sdr(ipmi_netfn_t, ipmi_cmd_t, ipmi_request_t request,
+                            ipmi_response_t response, ipmi_data_len_t data_len,
+                            ipmi_context_t)
 {
     ipmi_ret_t ret = IPMI_CC_OK;
     get_sdr::GetSdrReq* req = (get_sdr::GetSdrReq*)request;
     get_sdr::GetSdrResp* resp = (get_sdr::GetSdrResp*)response;
-    get_sdr::SensorDataFullRecord record = {0};
-    if (req != NULL)
-    {
-        // Note: we use an iterator so we can provide the next ID at the end of
-        // the call.
-        auto sensor = sensors.begin();
-        auto recordID = get_sdr::request::get_record_id(req);
 
-        // At the beginning of a scan, the host side will send us id=0.
-        if (recordID != 0)
+    // Note: we use an iterator so we can provide the next ID at the end of
+    // the call.
+    auto sensor = ipmi::sensor::sensors.begin();
+    auto recordID = get_sdr::request::get_record_id(req);
+
+    // At the beginning of a scan, the host side will send us id=0.
+    if (recordID != 0)
+    {
+        // recordID 0 to 255 means it is a FULL record.
+        // recordID 256 to 511 means it is a FRU record.
+        // recordID greater then 511 means it is a Entity Association
+        // record. Currently we are supporting three record types: FULL
+        // record, FRU record and Enttiy Association record.
+        if (recordID >= ENTITY_RECORD_ID_START)
         {
-            // recordID 0 to 255 means it is a FULL record.
-            // recordID 256 to 511 means it is a FRU record.
-            // recordID greater then 511 means it is a Entity Association
-            // record. Currently we are supporting three record types: FULL
-            // record, FRU record and Enttiy Association record.
-            if (recordID >= ENTITY_RECORD_ID_START)
+            return ipmi_entity_get_sdr(request, response, data_len);
+        }
+        else if (recordID >= FRU_RECORD_ID_START &&
+                 recordID < ENTITY_RECORD_ID_START)
+        {
+            return ipmi_fru_get_sdr(request, response, data_len);
+        }
+        else
+        {
+            sensor = ipmi::sensor::sensors.find(recordID);
+            if (sensor == ipmi::sensor::sensors.end())
             {
-                return ipmi_entity_get_sdr(request, response, data_len);
-            }
-            else if (recordID >= FRU_RECORD_ID_START &&
-                     recordID < ENTITY_RECORD_ID_START)
-            {
-                return ipmi_fru_get_sdr(request, response, data_len);
-            }
-            else
-            {
-                sensor = sensors.find(recordID);
-                if (sensor == sensors.end())
-                {
-                    return IPMI_CC_SENSOR_INVALID;
-                }
+                return IPMI_CC_SENSOR_INVALID;
             }
         }
+    }
 
-        uint8_t sensor_id = sensor->first;
+    uint8_t sensor_id = sensor->first;
 
+    auto it = sdrCacheMap.find(sensor_id);
+    if (it == sdrCacheMap.end())
+    {
         /* Header */
+        get_sdr::SensorDataFullRecord record = {};
         get_sdr::header::set_record_id(sensor_id, &(record.header));
         record.header.sdr_version = 0x51; // Based on IPMI Spec v2.0 rev 1.1
         record.header.record_type = get_sdr::SENSOR_DATA_FULL_RECORD;
-        record.header.record_length = sizeof(get_sdr::SensorDataFullRecord);
+        record.header.record_length = sizeof(record.key) + sizeof(record.body);
 
         /* Key */
         get_sdr::key::set_owner_id_bmc(&(record.key));
@@ -903,42 +1395,44 @@ ipmi_ret_t ipmi_sen_get_sdr(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
         }
 
         // Set the type-specific details given the DBus interface
-        ret = populate_record_from_dbus(&(record.body), &(sensor->second),
-                                        data_len);
-
-        if (++sensor == sensors.end())
-        {
-            // we have reached till end of sensor, so assign the next record id
-            // to 256(Max Sensor ID = 255) + FRU ID(may start with 0).
-            auto next_record_id =
-                (frus.size()) ? frus.begin()->first + FRU_RECORD_ID_START
-                              : END_OF_RECORD;
-
-            get_sdr::response::set_next_record_id(next_record_id, resp);
-        }
-        else
-        {
-            get_sdr::response::set_next_record_id(sensor->first, resp);
-        }
-
-        if (req->offset > sizeof(record))
-        {
-            return IPMI_CC_PARM_OUT_OF_RANGE;
-        }
-
-        // data_len will ultimately be the size of the record, plus
-        // the size of the next record ID:
-        *data_len = std::min(static_cast<size_t>(req->bytes_to_read),
-                             sizeof(record) - req->offset);
-
-        std::memcpy(resp->record_data,
-                    reinterpret_cast<uint8_t*>(&record) + req->offset,
-                    *data_len);
-
-        // data_len should include the LSB and MSB:
-        *data_len +=
-            sizeof(resp->next_record_id_lsb) + sizeof(resp->next_record_id_msb);
+        populate_record_from_dbus(&(record.body), &(sensor->second), data_len);
+        sdrCacheMap[sensor_id] = std::move(record);
     }
+
+    const auto& record = sdrCacheMap[sensor_id];
+
+    if (++sensor == ipmi::sensor::sensors.end())
+    {
+        // we have reached till end of sensor, so assign the next record id
+        // to 256(Max Sensor ID = 255) + FRU ID(may start with 0).
+        auto next_record_id = (frus.size())
+                                  ? frus.begin()->first + FRU_RECORD_ID_START
+                                  : END_OF_RECORD;
+
+        get_sdr::response::set_next_record_id(next_record_id, resp);
+    }
+    else
+    {
+        get_sdr::response::set_next_record_id(sensor->first, resp);
+    }
+
+    if (req->offset > sizeof(record))
+    {
+        return IPMI_CC_PARM_OUT_OF_RANGE;
+    }
+
+    // data_len will ultimately be the size of the record, plus
+    // the size of the next record ID:
+    *data_len = std::min(static_cast<size_t>(req->bytes_to_read),
+                         sizeof(record) - req->offset);
+
+    std::memcpy(resp->record_data,
+                reinterpret_cast<const uint8_t*>(&record) + req->offset,
+                *data_len);
+
+    // data_len should include the LSB and MSB:
+    *data_len += sizeof(resp->next_record_id_lsb) +
+                 sizeof(resp->next_record_id_msb);
 
     return ret;
 }
@@ -951,10 +1445,9 @@ static bool isFromSystemChannel()
     return true;
 }
 
-ipmi_ret_t ipmicmdPlatformEvent(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                ipmi_request_t request,
-                                ipmi_response_t response,
-                                ipmi_data_len_t dataLen, ipmi_context_t context)
+ipmi_ret_t ipmicmdPlatformEvent(ipmi_netfn_t, ipmi_cmd_t,
+                                ipmi_request_t request, ipmi_response_t,
+                                ipmi_data_len_t dataLen, ipmi_context_t)
 {
     uint16_t generatorID;
     size_t count;
@@ -1014,10 +1507,10 @@ ipmi_ret_t ipmicmdPlatformEvent(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     assert = req->eventDirectionType & directionMask ? false : true;
     std::vector<uint8_t> eventData(req->data, req->data + count);
 
-    sdbusplus::bus::bus dbus(bus);
+    sdbusplus::bus_t dbus(bus);
     std::string service =
         ipmi::getService(dbus, ipmiSELAddInterface, ipmiSELPath);
-    sdbusplus::message::message writeSEL = dbus.new_method_call(
+    sdbusplus::message_t writeSEL = dbus.new_method_call(
         service.c_str(), ipmiSELPath, ipmiSELAddInterface, "IpmiSelAdd");
     writeSEL.append(ipmiSELAddMessage, sensorPath, eventData, assert,
                     generatorID);
@@ -1025,9 +1518,9 @@ ipmi_ret_t ipmicmdPlatformEvent(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     {
         dbus.call(writeSEL);
     }
-    catch (sdbusplus::exception_t& e)
+    catch (const sdbusplus::exception_t& e)
     {
-        phosphor::logging::log<phosphor::logging::level::ERR>(e.what());
+        lg2::error("exception message: {ERROR}", "ERROR", e);
         return IPMI_CC_UNSPECIFIED_ERROR;
     }
     return IPMI_CC_OK;
@@ -1035,41 +1528,61 @@ ipmi_ret_t ipmicmdPlatformEvent(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
 void register_netfn_sen_functions()
 {
-    // <Wildcard Command>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_WILDCARD, nullptr,
-                           ipmi_sen_wildcard, PRIVILEGE_USER);
+    // Handlers with dbus-sdr handler implementation.
+    // Do not register the hander if it dynamic sensors stack is used.
 
-    // <Platform Event Message>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_PLATFORM_EVENT, nullptr,
-                           ipmicmdPlatformEvent, PRIVILEGE_OPERATOR);
-    // <Get Sensor Type>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_GET_SENSOR_TYPE, nullptr,
-                           ipmi_sen_get_sensor_type, PRIVILEGE_USER);
+#ifndef FEATURE_DYNAMIC_SENSORS
+
+#ifdef FEATURE_SENSORS_CACHE
+    // Initialize the sensor matches
+    initSensorMatches();
+#endif
 
     // <Set Sensor Reading and Event Status>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_SET_SENSOR, nullptr,
-                           ipmi_sen_set_sensor, PRIVILEGE_OPERATOR);
-
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdSetSensorReadingAndEvtSts,
+                          ipmi::Privilege::Operator, ipmiSetSensorReading);
     // <Get Sensor Reading>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_GET_SENSOR_READING, nullptr,
-                           ipmi_sen_get_sensor_reading, PRIVILEGE_USER);
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdGetSensorReading,
+                          ipmi::Privilege::User, ipmiSensorGetSensorReading);
 
     // <Reserve Device SDR Repository>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_RESERVE_DEVICE_SDR_REPO,
-                           nullptr, ipmi_sen_reserve_sdr, PRIVILEGE_USER);
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdReserveDeviceSdrRepository,
+                          ipmi::Privilege::User, ipmiSensorReserveSdr);
 
     // <Get Device SDR Info>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_GET_DEVICE_SDR_INFO, nullptr,
-                           ipmi_sen_get_sdr_info, PRIVILEGE_USER);
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdGetDeviceSdrInfo,
+                          ipmi::Privilege::User, ipmiSensorGetDeviceSdrInfo);
+
+    // <Get Sensor Thresholds>
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdGetSensorThreshold,
+                          ipmi::Privilege::User, ipmiSensorGetSensorThresholds);
+
+    // <Set Sensor Thresholds>
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdSetSensorThreshold,
+                          ipmi::Privilege::User, ipmiSenSetSensorThresholds);
 
     // <Get Device SDR>
     ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_GET_DEVICE_SDR, nullptr,
                            ipmi_sen_get_sdr, PRIVILEGE_USER);
 
-    // <Get Sensor Thresholds>
-    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_GET_SENSOR_THRESHOLDS,
-                           nullptr, ipmi_sen_get_sensor_thresholds,
-                           PRIVILEGE_USER);
+#endif
+
+    // Common Handers used by both implementation.
+
+    // <Platform Event Message>
+    ipmi_register_callback(NETFUN_SENSOR, IPMI_CMD_PLATFORM_EVENT, nullptr,
+                           ipmicmdPlatformEvent, PRIVILEGE_OPERATOR);
+
+    // <Get Sensor Type>
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdGetSensorType,
+                          ipmi::Privilege::User, ipmiGetSensorType);
 
     return;
 }

@@ -1,14 +1,19 @@
+
 #include "config.h"
 
 #include "host-interface.hpp"
 
 #include "systemintfcmds.hpp"
 
-#include <functional>
 #include <ipmid-host/cmd-utils.hpp>
 #include <ipmid-host/cmd.hpp>
+#include <ipmid/api.hpp>
 #include <ipmid/utils.hpp>
-#include <phosphor-logging/log.hpp>
+#include <phosphor-logging/lg2.hpp>
+
+#include <functional>
+#include <memory>
+#include <optional>
 
 namespace phosphor
 {
@@ -18,7 +23,7 @@ namespace command
 {
 
 // When you see Base:: you know we're referencing our base class
-namespace Base = sdbusplus::xyz::openbmc_project::Control::server;
+namespace Base = sdbusplus::server::xyz::openbmc_project::control;
 
 // IPMI OEM command.
 // https://github.com/openbmc/openbmc/issues/2082 for handling
@@ -43,18 +48,15 @@ static const std::map<Host::Command, IpmiCmdData> ipmiCommand = {
 // Called at user request
 void Host::execute(Base::Host::Command command)
 {
-    using namespace phosphor::logging;
+    lg2::debug("Pushing cmd on to queue, control host cmd: {CONTROL_HOST_CMD}",
+               "CONTROL_HOST_CMD", convertForMessage(command));
 
-    log<level::DEBUG>(
-        "Pushing cmd on to queue",
-        entry("CONTROL_HOST_CMD=%s", convertForMessage(command).c_str()));
+    auto cmd = std::make_tuple(
+        ipmiCommand.at(command),
+        std::bind(&Host::commandStatusHandler, this, std::placeholders::_1,
+                  std::placeholders::_2));
 
-    auto cmd = std::make_tuple(ipmiCommand.at(command),
-                               std::bind(&Host::commandStatusHandler, this,
-                                         std::placeholders::_1,
-                                         std::placeholders::_2));
-
-    return ipmid_send_cmd_to_host(std::move(cmd));
+    ipmid_send_cmd_to_host(std::move(cmd));
 }
 
 // Called into by Command Manager
@@ -65,6 +67,54 @@ void Host::commandStatusHandler(IpmiCmdData cmd, bool status)
 
     // Fire a signal
     this->commandComplete(intfCommand.at(std::get<0>(cmd)), value);
+}
+
+Host::FirmwareCondition Host::currentFirmwareCondition() const
+{
+    // shared object used to wait for host response
+    auto hostCondition =
+        std::make_shared<std::optional<Host::FirmwareCondition>>();
+
+    // callback for command to host
+    auto hostAckCallback = [hostCondition](IpmiCmdData, bool status) {
+        auto value = status ? Host::FirmwareCondition::Running
+                            : Host::FirmwareCondition::Off;
+
+        lg2::debug("currentFirmwareCondition:hostAckCallback fired, "
+                   "control host cmd: {CONTROL_HOST_CMD}",
+                   "CONTROL_HOST_CMD", value);
+
+        *(hostCondition.get()) = value;
+        return;
+    };
+
+    auto cmd = phosphor::host::command::CommandHandler(
+        ipmiCommand.at(Base::Host::Command::Heartbeat),
+        std::move(hostAckCallback));
+
+    ipmid_send_cmd_to_host(std::move(cmd));
+
+    // Timer to ensure this function returns something within a reasonable time
+    sdbusplus::Timer hostAckTimer([hostCondition]() {
+        lg2::debug("currentFirmwareCondition: timer expired!");
+        *(hostCondition.get()) = Host::FirmwareCondition::Off;
+    });
+
+    // Wait 1 second past the ATN_ACK timeout to ensure we wait for as
+    // long as the timeout
+    hostAckTimer.start(std::chrono::seconds(IPMI_SMS_ATN_ACK_TIMEOUT_SECS + 1));
+
+    auto io = getIoContext();
+
+    while (!hostCondition.get()->has_value())
+    {
+        lg2::debug("currentFirmwareCondition: waiting for host response");
+        io->run_for(std::chrono::milliseconds(100));
+    }
+    hostAckTimer.stop();
+
+    lg2::debug("currentFirmwareCondition: hostCondition is ready!");
+    return hostCondition.get()->value();
 }
 
 } // namespace command

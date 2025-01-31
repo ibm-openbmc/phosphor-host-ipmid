@@ -1,4 +1,4 @@
-/*
+/*.
 // Copyright (c) 2018 Intel Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +16,13 @@
 #pragma once
 #include "user_layer.hpp"
 
-#include <ipmid/api.h>
-
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/interprocess/sync/named_recursive_mutex.hpp>
+#include <ipmid/api.hpp>
+#include <sdbusplus/bus.hpp>
+
 #include <cstdint>
 #include <ctime>
-#include <sdbusplus/bus.hpp>
 #include <variant>
 
 namespace ipmi
@@ -75,6 +75,7 @@ struct UserInfo
     bool userEnabled;
     bool userInSystem;
     bool fixedUserName;
+    PayloadAccess payloadAccess[ipmiMaxChannels];
 };
 
 /** @struct UsersTbl
@@ -86,6 +87,16 @@ struct UsersTbl
     //+1 to map with UserId directly. UserId 0 is reserved.
     UserInfo user[ipmiMaxUsers + 1];
 };
+
+/** @brief PAM User Authentication check
+ *
+ *  @param[in] username - username in string
+ *  @param[in] password	- password in string
+ *
+ *  @return status
+ */
+bool pamUserCheckAuthenticate(std::string_view username,
+                              std::string_view password);
 
 class UserAccess;
 
@@ -154,7 +165,13 @@ class UserAccess
      *
      *  @return true if valid, false otherwise
      */
-    bool isValidUserName(const char* userNameInChar);
+    bool isValidUserName(const std::string& userName);
+
+    /** @brief determines whether ipmi is in available groups list
+     *
+     * @return true if ipmi group is present, false otherwise
+     */
+    bool isIpmiInAvailableGroupList();
 
     /** @brief provides user id of the user
      *
@@ -186,47 +203,46 @@ class UserAccess
      *  @param[in] userId - user id
      *  @param[out] userName - user name
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t getUserName(const uint8_t userId, std::string& userName);
+    Cc getUserName(const uint8_t userId, std::string& userName);
 
     /** @brief to set user name
      *
      *  @param[in] userId - user id
-     *  @param[in] userNameInChar - user name
+     *  @param[in] userName - user name
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setUserName(const uint8_t userId, const char* userNameInChar);
+    Cc setUserName(const uint8_t userId, const std::string& userName);
 
     /** @brief to set user enabled state
      *
      *  @param[in] userId - user id
      *  @param[in] enabledState - enabled state of the user
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setUserEnabledState(const uint8_t userId,
-                                   const bool& enabledState);
+    Cc setUserEnabledState(const uint8_t userId, const bool& enabledState);
 
     /** @brief to set user password
      *
      *  @param[in] userId - user id
      *  @param[in] userPassword  - new password of the user
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setUserPassword(const uint8_t userId, const char* userPassword);
+    Cc setUserPassword(const uint8_t userId, const char* userPassword);
 
     /** @brief to set special user password
      *
      *  @param[in] userName - user name
      *  @param[in] userPassword  - new password of the user
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setSpecialUserPassword(const std::string& userName,
-                                      const std::string& userPassword);
+    Cc setSpecialUserPassword(const std::string& userName,
+                              const SecureString& userPassword);
 
     /** @brief to set user privilege and access details
      *
@@ -236,11 +252,60 @@ class UserAccess
      *  @param[in] otherPrivUpdates - other privilege update flag to update ipmi
      * enable, link authentication and access callback
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setUserPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
-                                      const UserPrivAccess& privAccess,
-                                      const bool& otherPrivUpdates);
+    Cc setUserPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
+                              const UserPrivAccess& privAccess,
+                              const bool& otherPrivUpdates);
+
+    /** @brief to get user payload access details from userInfo entry.
+     *
+     *  @param[in] userInfo    - userInfo entry in usersTbl.
+     *  @param[out] stdPayload - stdPayloadEnables1 in a 2D-array.
+     *  @param[out] oemPayload - oemPayloadEnables1 in a 2D-array.
+     *
+     *  @details Update the given 2D-arrays using the payload access details
+     *  available in the given userInfo entry (from usersTbl).
+     *  This 2D-array will be mapped to a JSON object (which will be written to
+     *  a JSON file subsequently).
+     */
+    void readPayloadAccessFromUserInfo(
+        const UserInfo& userInfo,
+        std::array<std::array<bool, ipmiMaxChannels>, payloadsPerByte>&
+            stdPayload,
+        std::array<std::array<bool, ipmiMaxChannels>, payloadsPerByte>&
+            oemPayload);
+
+    /** @brief to update user payload access details in userInfo entry.
+     *
+     *  @param[in] stdPayload - stdPayloadEnables1 in a 2D-array.
+     *  @param[in] oemPayload - oemPayloadEnables1 in a 2D-array.
+     *  @param[out] userInfo  - userInfo entry in usersTbl.
+     *
+     *  @details Update user payload access details of a given userInfo
+     *  entry (in usersTbl) with the information provided in given 2D-arrays.
+     *  This 2D-array was created out of a JSON object (which was created by
+     *  parsing a JSON file).
+     */
+    void updatePayloadAccessInUserInfo(
+        const std::array<std::array<bool, ipmiMaxChannels>, payloadsPerByte>&
+            stdPayload,
+        const std::array<std::array<bool, ipmiMaxChannels>, payloadsPerByte>&
+            oemPayload,
+        UserInfo& userInfo);
+
+    /** @brief to set user payload access details
+     *
+     *  @param[in] chNum - channel number
+     *  @param[in] operation - Enable / Disable
+     *  @param[in] userId - user id
+     *  @param[in] payloadAccess - payload access
+     *
+     *  @return ccSuccess for success, others for failure.
+     */
+    Cc setUserPayloadAccess(const uint8_t chNum, const uint8_t operation,
+                            const uint8_t userId,
+                            const PayloadAccess& payloadAccess);
 
     /** @brief reads user management related data from configuration file
      *
@@ -314,8 +379,8 @@ class UserAccess
     UsersTbl usersTbl;
     std::vector<std::string> availablePrivileges;
     std::vector<std::string> availableGroups;
-    sdbusplus::bus::bus bus;
-    std::time_t fileLastUpdatedTime;
+    sdbusplus::bus_t bus;
+    std::timespec fileLastUpdatedTime;
     bool signalHndlrObject = false;
     boost::interprocess::file_lock sigHndlrLock;
     boost::interprocess::file_lock mutexCleanupLock;
@@ -324,7 +389,7 @@ class UserAccess
      *
      *  @return time stamp or -EIO for failure
      */
-    std::time_t getUpdatedFileTime();
+    std::timespec getUpdatedFileTime();
 
     /** @brief function to available system privileges and groups
      *
@@ -332,8 +397,10 @@ class UserAccess
     void getSystemPrivAndGroups();
 
     /** @brief function to init user data from configuration & D-Bus objects
+     * and to register for signals
      *
      */
-    void initUserDataFile();
+    void cacheUserDataFile();
 };
+
 } // namespace ipmi

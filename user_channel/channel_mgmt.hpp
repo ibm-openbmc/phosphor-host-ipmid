@@ -16,13 +16,15 @@
 
 #pragma once
 #include "channel_layer.hpp"
+#include "ipmid/api-types.hpp"
 
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/interprocess/sync/named_recursive_mutex.hpp>
-#include <cstdint>
-#include <ctime>
 #include <nlohmann/json.hpp>
 #include <sdbusplus/bus.hpp>
+
+#include <cstdint>
+#include <ctime>
 #include <variant>
 
 namespace ipmi
@@ -63,6 +65,7 @@ struct ChannelProperties
     ChannelInfo chInfo;
     ChannelAccessData chAccess;
     size_t maxTransferSize;
+    bool isManagementNIC;
 };
 
 class ChannelConfig;
@@ -146,19 +149,18 @@ class ChannelConfig
      *  @param[in] chNum - channel number
      *  @param[out] chInfo - channel info details
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t getChannelInfo(const uint8_t chNum, ChannelInfo& chInfo);
+    Cc getChannelInfo(const uint8_t chNum, ChannelInfo& chInfo);
 
     /** @brief provides channel access data
      *
      *  @param[in] chNum - channel number
      *  @param[out] chAccessData - channel access data
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t getChannelAccessData(const uint8_t chNum,
-                                    ChannelAccess& chAccessData);
+    Cc getChannelAccessData(const uint8_t chNum, ChannelAccess& chAccessData);
 
     /** @brief to set channel access data
      *
@@ -166,21 +168,21 @@ class ChannelConfig
      *  @param[in] chAccessData - channel access data
      *  @param[in] setFlag - flag to indicate updatable fields
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setChannelAccessData(const uint8_t chNum,
-                                    const ChannelAccess& chAccessData,
-                                    const uint8_t setFlag);
+    Cc setChannelAccessData(const uint8_t chNum,
+                            const ChannelAccess& chAccessData,
+                            const uint8_t setFlag);
 
     /** @brief to get channel access data persistent data
      *
      *  @param[in] chNum - channel number
      *  @param[out] chAccessData - channel access data
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t getChannelAccessPersistData(const uint8_t chNum,
-                                           ChannelAccess& chAccessData);
+    Cc getChannelAccessPersistData(const uint8_t chNum,
+                                   ChannelAccess& chAccessData);
 
     /** @brief to set channel access data persistent data
      *
@@ -188,21 +190,21 @@ class ChannelConfig
      *  @param[in] chAccessData - channel access data
      *  @param[in] setFlag - flag to indicate updatable fields
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t setChannelAccessPersistData(const uint8_t chNum,
-                                           const ChannelAccess& chAccessData,
-                                           const uint8_t setFlag);
+    Cc setChannelAccessPersistData(const uint8_t chNum,
+                                   const ChannelAccess& chAccessData,
+                                   const uint8_t setFlag);
 
     /** @brief provides supported authentication type for the channel
      *
      *  @param[in] chNum - channel number
      *  @param[out] authTypeSupported - supported authentication type
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t getChannelAuthTypeSupported(const uint8_t chNum,
-                                           uint8_t& authTypeSupported);
+    Cc getChannelAuthTypeSupported(const uint8_t chNum,
+                                   uint8_t& authTypeSupported);
 
     /** @brief provides enabled authentication type for the channel
      *
@@ -210,11 +212,10 @@ class ChannelConfig
      *  @param[in] priv - privilege
      *  @param[out] authType - enabled authentication type
      *
-     *  @return IPMI_CC_OK for success, others for failure.
+     *  @return ccSuccess for success, others for failure.
      */
-    ipmi_ret_t getChannelEnabledAuthType(const uint8_t chNum,
-                                         const uint8_t priv,
-                                         EAuthType& authType);
+    Cc getChannelEnabledAuthType(const uint8_t chNum, const uint8_t priv,
+                                 EAuthType& authType);
 
     /** @brief conver to channel privilege from system privilege
      *
@@ -223,14 +224,6 @@ class ChannelConfig
      *  @return Channel privilege
      */
     CommandPrivilege convertToPrivLimitIndex(const std::string& value);
-
-    /** @brief function to convert channel number to channel index
-     *
-     *  @param[in] chNum - channel number
-     *
-     *  @return channel index
-     */
-    uint8_t convertToChannelIndexNumber(const uint8_t chNum);
 
     /** @brief function to write persistent channel configuration to config file
      *
@@ -244,6 +237,14 @@ class ChannelConfig
      */
     int writeChannelVolatileData();
 
+    /** @brief Returns the IPMI channel ID authorized to push IPMI privilege
+     * changes to phosphor-user-manager. Any channel access changes made on
+     * any other channel are ignored.
+     *
+     *  @return IPMI channel ID as defined in channel_config.json
+     */
+    uint8_t getManagementNICID();
+
   private:
     uint32_t signalFlag = 0;
     std::unique_ptr<boost::interprocess::named_recursive_mutex> channelMutex{
@@ -252,7 +253,7 @@ class ChannelConfig
     std::time_t nvFileLastUpdatedTime;
     std::time_t voltFileLastUpdatedTime;
     boost::interprocess::file_lock mutexCleanupLock;
-    sdbusplus::bus::bus bus;
+    sdbusplus::bus_t bus;
     bool signalHndlrObjectState = false;
     boost::interprocess::file_lock sigHndlrLock;
 
@@ -320,20 +321,6 @@ class ChannelConfig
     int setDbusProperty(const std::string& service, const std::string& objPath,
                         const std::string& interface,
                         const std::string& property, const DbusVariant& value);
-
-    /** @brief function to get D-Bus property value
-     *
-     *  @param[in] service - service name
-     *  @param[in] objPath - object path
-     *  @param[in] interface - interface
-     *  @param[in] property - property name
-     *  @param[out] value - property value
-     *
-     *  @return 0 for success, -errno for failure.
-     */
-    int getDbusProperty(const std::string& service, const std::string& objPath,
-                        const std::string& interface,
-                        const std::string& property, DbusVariant& value);
 
     /** @brief function to read json config file
      *

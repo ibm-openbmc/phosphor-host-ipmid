@@ -15,14 +15,17 @@
  */
 #pragma once
 
-#include <algorithm>
 #include <boost/asio/spawn.hpp>
-#include <cstdint>
-#include <exception>
 #include <ipmid/api-types.hpp>
 #include <ipmid/message/types.hpp>
+#include <ipmid/types.hpp>
+#include <phosphor-logging/lg2.hpp>
+#include <sdbusplus/asio/connection.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <memory>
-#include <phosphor-logging/log.hpp>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -34,27 +37,35 @@ struct Context
 {
     using ptr = std::shared_ptr<Context>;
 
-    Context() = default;
+    Context() = delete;
+    Context(const Context&) = default;
+    Context& operator=(const Context&) = default;
+    Context(Context&&) = delete;
+    Context& operator=(Context&&) = delete;
 
-    Context(NetFn netFn, Cmd cmd, int channel, int userId, Privilege priv,
-            int rqSA = 0, boost::asio::yield_context* yield = nullptr) :
-        netFn(netFn),
-        cmd(cmd), channel(channel), userId(userId), priv(priv), rqSA(rqSA),
-        yield(yield)
-    {
-    }
+    Context(std::shared_ptr<sdbusplus::asio::connection> bus, NetFn netFn,
+            uint8_t lun, Cmd cmd, int channel, int userId, uint32_t sessionId,
+            Privilege priv, int rqSA, int hostIdx,
+            boost::asio::yield_context& yield) :
+        bus(bus), netFn(netFn), lun(lun), cmd(cmd), channel(channel),
+        userId(userId), sessionId(sessionId), priv(priv), rqSA(rqSA),
+        hostIdx(hostIdx), yield(yield)
+    {}
 
+    std::shared_ptr<sdbusplus::asio::connection> bus;
     // normal IPMI context (what call is this, from whence it came...)
-    NetFn netFn = 0;
-    Cmd cmd = 0;
-    int channel = 0;
-    int userId = 0;
-    Privilege priv = Privilege::None;
+    NetFn netFn;
+    uint8_t lun;
+    Cmd cmd;
+    int channel;
+    int userId;
+    uint32_t sessionId;
+    Privilege priv;
     // srcAddr is only set on IPMB requests because
     // Platform Event Message needs it to determine the incoming format
-    int rqSA = 0;
-    // if non-null, use this to do blocking asynchronous asio calls
-    boost::asio::yield_context* yield = nullptr;
+    int rqSA;
+    int hostIdx;
+    boost::asio::yield_context yield;
 };
 
 namespace message
@@ -104,17 +115,16 @@ struct Payload
     Payload(Payload&&) = default;
     Payload& operator=(Payload&&) = default;
 
-    explicit Payload(std::vector<uint8_t>&& data) : raw(std::move(data))
-    {
-    }
+    explicit Payload(SecureBuffer&& data) : raw(std::move(data)) {}
 
     ~Payload()
     {
-        using namespace phosphor::logging;
         if (raw.size() != 0 && std::uncaught_exceptions() == 0 && !trailingOk &&
             !unpackCheck && !unpackError)
         {
-            log<level::ERR>("Failed to check request for full unpack");
+            lg2::error(
+                "Failed to check request for full unpack: raw size: {RAW_SIZE}",
+                "RAW_SIZE", raw.size());
         }
     }
 
@@ -469,7 +479,7 @@ struct Payload
     // partial bytes in the form of bits
     fixed_uint_t<details::bitStreamSize> bitStream;
     size_t bitCount = 0;
-    std::vector<uint8_t> raw;
+    SecureBuffer raw;
     size_t rawIndex = 0;
     bool trailingOk = true;
     bool unpackCheck = false;
@@ -503,8 +513,7 @@ struct Response
 
     explicit Response(Context::ptr& context) :
         payload(), ctx(context), cc(ccSuccess)
-    {
-    }
+    {}
 
     /**
      * @brief pack arbitrary values (of any supported type) into the payload
@@ -583,10 +592,9 @@ struct Request
 
     using ptr = std::shared_ptr<Request>;
 
-    explicit Request(Context::ptr context, std::vector<uint8_t>&& d) :
-        payload(std::forward<std::vector<uint8_t>>(d)), ctx(context)
-    {
-    }
+    explicit Request(Context::ptr context, SecureBuffer&& d) :
+        payload(std::forward<SecureBuffer>(d)), ctx(context)
+    {}
 
     /**
      * @brief unpack arbitrary values (of any supported type) from the payload

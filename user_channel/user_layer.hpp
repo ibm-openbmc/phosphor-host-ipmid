@@ -14,8 +14,11 @@
 // limitations under the License.
 */
 #pragma once
-#include <ipmid/api.h>
 
+#include <ipmid/api.hpp>
+#include <ipmid/types.hpp>
+
+#include <bitset>
 #include <string>
 
 namespace ipmi
@@ -37,6 +40,7 @@ static constexpr uint8_t ipmiMaxUsers = 15;
 static constexpr uint8_t ipmiMaxChannels = 16;
 static constexpr uint8_t maxIpmi20PasswordSize = 20;
 static constexpr uint8_t maxIpmi15PasswordSize = 16;
+static constexpr uint8_t payloadsPerByte = 8;
 
 /** @struct PrivAccess
  *
@@ -46,26 +50,39 @@ static constexpr uint8_t maxIpmi15PasswordSize = 16;
 struct PrivAccess
 {
 #if BYTE_ORDER == LITTLE_ENDIAN
-    uint8_t privilege : 4;
-    uint8_t ipmiEnabled : 1;
-    uint8_t linkAuthEnabled : 1;
-    uint8_t accessCallback : 1;
-    uint8_t reserved : 1;
+    uint8_t privilege:4;
+    uint8_t ipmiEnabled:1;
+    uint8_t linkAuthEnabled:1;
+    uint8_t accessCallback:1;
+    uint8_t reserved:1;
 #endif
 #if BYTE_ORDER == BIG_ENDIAN
-    uint8_t reserved : 1;
-    uint8_t accessCallback : 1;
-    uint8_t linkAuthEnabled : 1;
-    uint8_t ipmiEnabled : 1;
-    uint8_t privilege : 4;
+    uint8_t reserved:1;
+    uint8_t accessCallback:1;
+    uint8_t linkAuthEnabled:1;
+    uint8_t ipmiEnabled:1;
+    uint8_t privilege:4;
 #endif
 } __attribute__((packed));
 
+/** @struct UserPayloadAccess
+ *
+ *  Structure to denote payload access restrictions applicable for a
+ *  given user and channel. (refer spec sec 24.6)
+ */
+struct PayloadAccess
+{
+    std::bitset<payloadsPerByte> stdPayloadEnables1;
+    std::bitset<payloadsPerByte> stdPayloadEnables2Reserved;
+    std::bitset<payloadsPerByte> oemPayloadEnables1;
+    std::bitset<payloadsPerByte> oemPayloadEnables2Reserved;
+};
+
 /** @brief initializes user management
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserInit();
+Cc ipmiUserInit();
 
 /** @brief The ipmi get user password layer call
  *
@@ -73,7 +90,7 @@ ipmi_ret_t ipmiUserInit();
  *
  *  @return password or empty string
  */
-std::string ipmiUserGetPassword(const std::string& userName);
+SecureString ipmiUserGetPassword(const std::string& userName);
 
 /** @brief The IPMI call to clear password entry associated with specified
  * username
@@ -82,7 +99,7 @@ std::string ipmiUserGetPassword(const std::string& userName);
  *
  *  @return 0 on success, non-zero otherwise.
  */
-ipmi_ret_t ipmiClearUserEntryPassword(const std::string& userName);
+Cc ipmiClearUserEntryPassword(const std::string& userName);
 
 /** @brief The IPMI call to reuse password entry for the renamed user
  *  to another one
@@ -92,8 +109,8 @@ ipmi_ret_t ipmiClearUserEntryPassword(const std::string& userName);
  *
  *  @return 0 on success, non-zero otherwise.
  */
-ipmi_ret_t ipmiRenameUserEntryPassword(const std::string& userName,
-                                       const std::string& newUserName);
+Cc ipmiRenameUserEntryPassword(const std::string& userName,
+                               const std::string& newUserName);
 
 /** @brief determines valid userId
  *
@@ -120,42 +137,47 @@ bool ipmiUserIsValidPrivilege(const uint8_t priv);
 uint8_t ipmiUserGetUserId(const std::string& userName);
 
 /** @brief set's user name
+ *  This API is deprecated
+ */
+Cc ipmiUserSetUserName(const uint8_t userId, const char* userName)
+    __attribute__((deprecated));
+
+/** @brief set's user name
  *
  *  @param[in] userId - user id
  *  @param[in] userName - user name
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserSetUserName(const uint8_t userId, const char* userName);
+Cc ipmiUserSetUserName(const uint8_t userId, const std::string& userName);
 
 /** @brief set user password
  *
  *  @param[in] userId - user id
  *  @param[in] userPassword - New Password
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserSetUserPassword(const uint8_t userId,
-                                   const char* userPassword);
+Cc ipmiUserSetUserPassword(const uint8_t userId, const char* userPassword);
 
 /** @brief set special user password (non-ipmi accounts)
  *
  *  @param[in] userName - user name
  *  @param[in] userPassword - New Password
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiSetSpecialUserPassword(const std::string& userName,
-                                      const std::string& userPassword);
+Cc ipmiSetSpecialUserPassword(const std::string& userName,
+                              const SecureString& userPassword);
 
 /** @brief get user name
  *
  *  @param[in] userId - user id
  *  @param[out] userName - user name
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserGetUserName(const uint8_t userId, std::string& userName);
+Cc ipmiUserGetUserName(const uint8_t userId, std::string& userName);
 
 /** @brief provides available fixed, max, and enabled user counts
  *
@@ -163,28 +185,28 @@ ipmi_ret_t ipmiUserGetUserName(const uint8_t userId, std::string& userName);
  *  @param[out] enabledUsers - enabled user count
  *  @param[out] fixedUsers - fixed user count
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserGetAllCounts(uint8_t& maxChUsers, uint8_t& enabledUsers,
-                                uint8_t& fixedUsers);
+Cc ipmiUserGetAllCounts(uint8_t& maxChUsers, uint8_t& enabledUsers,
+                        uint8_t& fixedUsers);
 
 /** @brief function to update user enabled state
  *
  *  @param[in] userId - user id
  *..@param[in] state - state of the user to be updated, true - user enabled.
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserUpdateEnabledState(const uint8_t userId, const bool& state);
+Cc ipmiUserUpdateEnabledState(const uint8_t userId, const bool& state);
 
 /** @brief determines whether user is enabled
  *
  *  @param[in] userId - user id
  *..@param[out] state - state of the user
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserCheckEnabled(const uint8_t userId, bool& state);
+Cc ipmiUserCheckEnabled(const uint8_t userId, bool& state);
 
 /** @brief provides user privilege access data
  *
@@ -192,10 +214,10 @@ ipmi_ret_t ipmiUserCheckEnabled(const uint8_t userId, bool& state);
  *  @param[in] chNum - channel number
  *  @param[out] privAccess - privilege access data
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserGetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
-                                      PrivAccess& privAccess);
+Cc ipmiUserGetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
+                              PrivAccess& privAccess);
 
 /** @brief sets user privilege access data
  *
@@ -204,10 +226,45 @@ ipmi_ret_t ipmiUserGetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
  *  @param[in] privAccess - privilege access data
  *  @param[in] otherPrivUpdate - flags to indicate other fields update
  *
- *  @return IPMI_CC_OK for success, others for failure.
+ *  @return ccSuccess for success, others for failure.
  */
-ipmi_ret_t ipmiUserSetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
-                                      const PrivAccess& privAccess,
-                                      const bool& otherPrivUpdate);
+Cc ipmiUserSetPrivilegeAccess(const uint8_t userId, const uint8_t chNum,
+                              const PrivAccess& privAccess,
+                              const bool& otherPrivUpdate);
+
+/** @brief check for user pam authentication. This is to determine, whether user
+ * is already locked out for failed login attempt
+ *
+ *  @param[in] username - username
+ *  @param[in] password - password
+ *
+ *  @return status
+ */
+bool ipmiUserPamAuthenticate(std::string_view userName,
+                             std::string_view userPassword);
+
+/** @brief sets user payload access data
+ *
+ *  @param[in] chNum - channel number
+ *  @param[in] operation - ENABLE / DISABLE operation
+ *  @param[in] userId - user id
+ *  @param[in] payloadAccess - payload access data
+ *
+ *  @return ccSuccess for success, others for failure.
+ */
+Cc ipmiUserSetUserPayloadAccess(const uint8_t chNum, const uint8_t operation,
+                                const uint8_t userId,
+                                const PayloadAccess& payloadAccess);
+
+/** @brief provides user payload access data
+ *
+ *  @param[in] chNum - channel number
+ *  @param[in] userId - user id
+ *  @param[out] payloadAccess - payload access data
+ *
+ *  @return ccSuccess for success, others for failure.
+ */
+Cc ipmiUserGetUserPayloadAccess(const uint8_t chNum, const uint8_t userId,
+                                PayloadAccess& payloadAccess);
 
 } // namespace ipmi

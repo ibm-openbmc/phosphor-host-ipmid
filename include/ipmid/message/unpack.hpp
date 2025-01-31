@@ -15,9 +15,11 @@
  */
 #pragma once
 
-#include <array>
 #include <ipmid/message/types.hpp>
+
+#include <array>
 #include <optional>
+#include <span>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -99,26 +101,29 @@ struct UnpackSingle
             }
             return 0;
         }
+        else if constexpr (utility::is_tuple<T>::value)
+        {
+            bool priorError = p.unpackError;
+            size_t priorIndex = p.rawIndex;
+            // more stuff to unroll if partial bytes are out
+            size_t priorBitCount = p.bitCount;
+            fixed_uint_t<details::bitStreamSize> priorBits = p.bitStream;
+            int ret = p.unpack(t);
+            if (ret != 0)
+            {
+                t = T();
+                p.rawIndex = priorIndex;
+                p.bitStream = priorBits;
+                p.bitCount = priorBitCount;
+                p.unpackError = priorError;
+            }
+            return ret;
+        }
         else
         {
-            if constexpr (utility::is_tuple<T>::value)
-            {
-                bool priorError = p.unpackError;
-                size_t priorIndex = p.rawIndex;
-                // more stuff to unroll if partial bytes are out
-                size_t priorBitCount = p.bitCount;
-                fixed_uint_t<details::bitStreamSize> priorBits = p.bitStream;
-                int ret = p.unpack(t);
-                if (ret != 0)
-                {
-                    t = T();
-                    p.rawIndex = priorIndex;
-                    p.bitStream = priorBits;
-                    p.bitCount = priorBitCount;
-                    p.unpackError = priorError;
-                }
-                return 0;
-            }
+            static_assert(
+                utility::dependent_false<T>::value,
+                "Attempt to unpack a type that has no IPMI unpack operation");
         }
     }
 };
@@ -154,7 +159,7 @@ struct UnpackSingle<std::string>
 
 /** @brief Specialization of UnpackSingle for fixed_uint_t types
  */
-template <unsigned N>
+template <bitcount_t N>
 struct UnpackSingle<fixed_uint_t<N>>
 {
     static int op(Payload& p, fixed_uint_t<N>& t)
@@ -228,8 +233,8 @@ struct UnpackSingle<std::optional<T>>
         // more stuff to unroll if partial bytes are out
         size_t priorBitCount = p.bitCount;
         fixed_uint_t<details::bitStreamSize> priorBits = p.bitStream;
-        t.emplace();
-        int ret = UnpackSingle<T>::op(p, *t);
+        T value;
+        int ret = UnpackSingle<T>::op(p, value);
         if (ret != 0)
         {
             t.reset();
@@ -237,6 +242,10 @@ struct UnpackSingle<std::optional<T>>
             p.bitStream = priorBits;
             p.bitCount = priorBitCount;
             p.unpackError = priorError;
+        }
+        else
+        {
+            t.emplace(std::move(value));
         }
         return 0;
     }
@@ -289,18 +298,21 @@ struct UnpackSingle<std::vector<T>>
 {
     static int op(Payload& p, std::vector<T>& t)
     {
-        int ret = 0;
         while (p.rawIndex < p.raw.size())
         {
             t.emplace_back();
-            ret = UnpackSingle<T>::op(p, t.back());
-            if (ret)
+            if (UnpackSingle<T>::op(p, t.back()))
             {
                 t.pop_back();
                 break;
             }
         }
-        return ret;
+        // unpacking a vector is always successful:
+        // either stuff was unpacked successfully (return 0)
+        // or stuff was not unpacked, but should still return
+        // success because an empty vector or a not-fully-unpacked
+        // payload is not a failure.
+        return 0;
     }
 };
 
@@ -313,6 +325,33 @@ struct UnpackSingle<std::vector<uint8_t>>
         // copy out the remainder of the message
         t.reserve(p.raw.size() - p.rawIndex);
         t.insert(t.begin(), p.raw.begin() + p.rawIndex, p.raw.end());
+        p.rawIndex = p.raw.size();
+        return 0;
+    }
+};
+
+/** @brief Specialization of UnpackSingle for SecureBuffer */
+template <>
+struct UnpackSingle<SecureBuffer>
+{
+    static int op(Payload& p, SecureBuffer& t)
+    {
+        // copy out the remainder of the message
+        t.reserve(p.raw.size() - p.rawIndex);
+        t.insert(t.begin(), p.raw.begin() + p.rawIndex, p.raw.end());
+        p.rawIndex = p.raw.size();
+        return 0;
+    }
+};
+
+/** @brief Specialization of UnpackSingle for std::span<const uint8_t> */
+template <>
+struct UnpackSingle<std::span<const uint8_t>>
+{
+    static int op(Payload& p, std::span<const uint8_t>& t)
+    {
+        // copy out the remainder of the message
+        t = std::span<const uint8_t>(p.raw.begin() + p.rawIndex, p.raw.end());
         p.rawIndex = p.raw.size();
         return 0;
     }

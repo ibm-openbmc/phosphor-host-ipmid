@@ -1,10 +1,10 @@
-#include <forward_list>
+#include <boost/asio/signal_set.hpp>
 #include <ipmid/api.hpp>
-#include <memory>
-#include <phosphor-logging/log.hpp>
-#include <vector>
+#include <phosphor-logging/lg2.hpp>
 
-using namespace phosphor::logging;
+#include <forward_list>
+#include <memory>
+#include <vector>
 
 namespace
 {
@@ -47,9 +47,9 @@ class SignalHandler
     {
         if (ec)
         {
-            log<level::ERR>("Error in common signal handler",
-                            entry("SIGNAL=%d", sigNum),
-                            entry("ERROR=%s", ec.message().c_str()));
+            lg2::error("Error in common signal handler, "
+                       "signal: {SIGNAL}, error: {ERROR}",
+                       "SIGNAL", sigNum, "ERROR", ec.message());
             return;
         }
         for (auto h = handlers.begin(); h != handlers.end(); h++)

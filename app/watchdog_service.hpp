@@ -14,9 +14,9 @@ class WatchdogService
     WatchdogService();
 
     using Action =
-        sdbusplus::xyz::openbmc_project::State::server::Watchdog::Action;
+        sdbusplus::server::xyz::openbmc_project::state::Watchdog::Action;
     using TimerUse =
-        sdbusplus::xyz::openbmc_project::State::server::Watchdog::TimerUse;
+        sdbusplus::server::xyz::openbmc_project::state::Watchdog::TimerUse;
 
     /** @brief Resets the time remaining on the watchdog.
      *         Equivalent to setTimeRemaining(getInterval()).
@@ -35,6 +35,7 @@ class WatchdogService
         bool enabled;
         Action expireAction;
         TimerUse timerUse;
+        TimerUse expiredTimerUse;
         uint64_t interval;
         uint64_t timeRemaining;
     };
@@ -66,6 +67,12 @@ class WatchdogService
      */
     void setEnabled(bool enabled);
 
+    /** @brief Sets the value of the LogTimeout property on the host watchdog
+     *
+     *  @param[in] LogTimeout - The new LogTimeout value
+     */
+    void setLogTimeout(bool LogTimeout);
+
     /** @brief Sets the value of the expireAction property on the host watchdog
      *
      *  @param[in] expireAction - The new expireAction value
@@ -78,22 +85,22 @@ class WatchdogService
      */
     void setTimerUse(TimerUse timerUse);
 
+    /** @brief Sets the value of the ExpiredTimerUse property on the host
+     * watchdog
+     *
+     *  @param[in] timerUse - The new timerUse value
+     */
+    void setExpiredTimerUse(TimerUse timerUse);
+
     /** @brief Sets the value of the interval property on the host watchdog
      *
      *  @param[in] interval - The new interval value
      */
     void setInterval(uint64_t interval);
 
-    /** @brief Sets the value of the timeRemaining property on the host
-     *         watchdog
-     *
-     *  @param[in] timeRemaining - The new timeRemaining value
-     */
-    void setTimeRemaining(uint64_t timeRemaining);
-
   private:
     /** @brief sdbusplus handle */
-    sdbusplus::bus::bus bus;
+    sdbusplus::bus_t bus;
     /** @brief The name of the mapped host watchdog service */
     static ipmi::ServiceCache wd_service;
 
