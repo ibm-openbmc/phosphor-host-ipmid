@@ -1091,10 +1091,10 @@ int ChannelConfig::readChannelPersistData()
     }
     else if (!std::filesystem::file_size(channelNvDataFilename))
     {
-        log<level::DEBUG>("NV file (channelNvDataFilename) has a size of zero");
+        lg2::debug("NV file (channelNvDataFilename) has a size of zero");
         if (std::filesystem::remove(channelNvDataFilename))
         {
-            log<level::DEBUG>("NV file (channelNvDataFilename) is deleted");
+            lg2::debug("NV file (channelNvDataFilename) is deleted");
         }
         return -EIO;
     }
