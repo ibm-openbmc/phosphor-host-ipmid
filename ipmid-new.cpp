@@ -20,6 +20,7 @@
 #include <dlfcn.h>
 
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
 #include <host-cmd-manager.hpp>
 #include <ipmid-host/cmd.hpp>
@@ -801,7 +802,7 @@ void handleLegacyIpmiCommand(sdbusplus::message_t& m)
                     netFn, "CMD", lg2::hex, cmd);
             }
         },
-        {});
+        boost::asio::detached);
 }
 
 #endif /* ALLOW_DEPRECATED_API */

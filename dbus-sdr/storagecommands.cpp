@@ -20,8 +20,8 @@
 #include "selutility.hpp"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/container/flat_map.hpp>
-#include <boost/process.hpp>
 #include <ipmid/api.hpp>
 #include <ipmid/message.hpp>
 #include <ipmid/types.hpp>
@@ -346,11 +346,12 @@ void startMatch(void)
         });
 
     // call once to populate
-    boost::asio::spawn(*getIoContext(),
-                       [](boost::asio::yield_context yield) {
-                           replaceCacheFru(getSdBus(), yield);
-                       },
-                       {});
+    boost::asio::spawn(
+        *getIoContext(),
+        [](boost::asio::yield_context yield) {
+            replaceCacheFru(getSdBus(), yield);
+        },
+        boost::asio::detached);
 }
 
 /** @brief implements the read FRU data command
